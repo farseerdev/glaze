@@ -4,6 +4,9 @@
 #pragma once
 
 #include <array>
+#include <bit>
+#include <cstdint>
+#include <cstring>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -87,17 +90,49 @@ namespace glz
       inline constexpr std::array<char, 5> lazy_structural_chars{'"', '[', ']', '{', '}'};
 
       template <size_t... I>
-      GLZ_ALWAYS_INLINE const char* find_next_structural(const char* p, const char* end,
-                                                         std::index_sequence<I...>) noexcept
+      GLZ_ALWAYS_INLINE const char* find_next_structural_swar(const char* p, const char* end,
+                                                              std::index_sequence<I...>) noexcept
       {
          return glz::find_first_of<lazy_structural_chars[I]...>(p, end);
       }
 
       // Scans to the next byte the depth loops act on. Expanded from lazy_structural_chars so the
       // scan and the assertion below cannot describe different sets.
+      //
+      // glz::find_first_of (glaze/util/parse.hpp) is a shared utility scanning 8 bytes/iteration
+      // via SWAR - correct and generic, but this call site is hot enough (every container
+      // traversal in general_skip/skip_to_depth_zero/skip_value_lazy goes through it) to be worth
+      // a wider first pass. On clang/gcc, GCC/Clang vector extensions lower a 32-byte chunk to a
+      // single AVX2/SSE2 (or NEON) compare with no intrinsics, cutting the number of loop
+      // iterations 4x before falling back to find_first_of's 8-byte SWAR loop for the remainder.
+      // MSVC's cl.exe lacks vector extensions, so it falls straight through to find_first_of
+      // (this project builds with clang-cl, which does support them).
       GLZ_ALWAYS_INLINE const char* find_next_structural(const char* p, const char* end) noexcept
       {
-         return find_next_structural(p, end, std::make_index_sequence<lazy_structural_chars.size()>{});
+#if defined(__clang__) || defined(__GNUC__)
+         if (!std::is_constant_evaluated()) {
+            using vbytes = unsigned char __attribute__((vector_size(32)));
+            while (p + 32 <= end) {
+               vbytes chunk;
+               std::memcpy(&chunk, p, sizeof(chunk));
+               const vbytes hits =
+                  (chunk == '"') | (chunk == '[') | (chunk == ']') | (chunk == '{') | (chunk == '}');
+               std::uint64_t words[4];
+               std::memcpy(words, &hits, sizeof(words));
+               for (int w = 0; w < 4; ++w) {
+                  std::uint64_t bits = words[w];
+                  if constexpr (std::endian::native == std::endian::big) {
+                     bits = std::byteswap(bits);
+                  }
+                  if (bits) {
+                     return p + w * 8 + (countr_zero(bits) >> 3);
+                  }
+               }
+               p += 32;
+            }
+         }
+#endif
+         return find_next_structural_swar(p, end, std::make_index_sequence<lazy_structural_chars.size()>{});
       }
 
       static_assert(
