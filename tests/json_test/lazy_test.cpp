@@ -72,6 +72,15 @@ inline constexpr cursor_off_bounded_opts cursor_off_bounded{};
 inline constexpr cursor_on_partial_opts cursor_on_partial{};
 inline constexpr cursor_off_partial_opts cursor_off_partial{};
 
+// lazy_streaming_cursor_scalars: also records scalar extents, not just containers.
+struct cursor_scalars_on_opts : glz::opts
+{
+   bool lazy_streaming_cursor = true;
+   bool lazy_streaming_cursor_scalars = true;
+};
+
+inline constexpr cursor_scalars_on_opts cursor_scalars_on{};
+
 // Wide number skip. Like the cursor, it is only ever a speed difference, so its tests compare
 // the option on against the option off. Non-null-terminated only, which is where it applies.
 struct wide_num_on_opts : glz::opts
@@ -2098,6 +2107,89 @@ suite lazy_streaming_cursor_tests = [] {
       // grow lazy_document at all.
       expect(sizeof(glz::lazy_document<cursor_off>) == sizeof(glz::lazy_document<glz::opts{}>));
       expect(sizeof(glz::lazy_document<cursor_on>) > sizeof(glz::lazy_document<cursor_off>));
+   };
+};
+
+// ============================================================================
+// lazy_streaming_cursor_scalars
+// ============================================================================
+
+suite lazy_streaming_cursor_scalars_tests = [] {
+   "cursor_scalars_matches_uncursored_for_genuine_readers"_test = [&] {
+      // Every element is a scalar consumed by glaze's own num_t/string readers, which is exactly
+      // the case the option is for - it must not change the result.
+      const std::string mixed = R"({"rows":[1,"two",3.5,true,null,-6,"seven",8]})";
+      auto walk = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         std::string out;
+         for (auto& e : (*doc)["rows"]) {
+            out += e.raw_json();
+            out += '|';
+         }
+         return out;
+      };
+      expect(walk.template operator()<cursor_scalars_on>(mixed) == walk.template operator()<cursor_off>(mixed));
+      expect(walk.template operator()<cursor_scalars_on>(mixed) ==
+             R"(1|"two"|3.5|true|null|-6|"seven"|8|)");
+   };
+
+   "cursor_scalars_reads_agree_with_uncursored"_test = [&] {
+      // read_into (not just raw_json) over a run of short numeric cells - the RAMA-motivating
+      // shape (a row of scalar cells) - must land on the same elements and values.
+      std::string json = R"({"a":[)";
+      for (int i = 0; i < 64; ++i) {
+         if (i) json += ',';
+         json += std::to_string(i);
+      }
+      json += "]}";
+
+      auto sum = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         int64_t total{};
+         int count{};
+         for (auto& e : (*doc)["a"]) {
+            int64_t v{};
+            if (not e.read_into(v)) total += v;
+            if (++count > 128) break;
+         }
+         return std::pair{total, count};
+      };
+
+      const auto with = sum.template operator()<cursor_scalars_on>(json);
+      const auto without = sum.template operator()<cursor_off>(json);
+      expect(with == without);
+      expect(with.second == 64);
+   };
+
+   "cursor_scalars_requires_streaming_cursor"_test = [] {
+      // lazy_streaming_cursor_scalars without lazy_streaming_cursor is a no-op, not an error -
+      // check_lazy_streaming_cursor_scalars gates on both.
+      struct scalars_without_cursor_opts : glz::opts
+      {
+         bool lazy_streaming_cursor_scalars = true;
+      };
+      expect(sizeof(glz::lazy_document<scalars_without_cursor_opts{}>) ==
+             sizeof(glz::lazy_document<glz::opts{}>));
+   };
+
+   "cursor_scalars_documents_the_custom_reader_caveat"_test = [] {
+      // The trade this option makes, made visible rather than just asserted: glz::text swallows
+      // to the end of the buffer on success. Reading one scalar element that way under this
+      // option corrupts the recorded extent for the *next* advance - this is the caveat the
+      // option's doc comment (opts.hpp) warns about, not a bug to fix here.
+      const std::string json = R"({"rows":[1,2,3]})";
+      auto doc = glz::lazy_json<cursor_scalars_on>(json);
+      expect(doc.has_value());
+
+      auto it = (*doc)["rows"].begin();
+      glz::text first{}; // deliberately a custom over-consuming reader, on a scalar element
+      expect(not(*it).read_into(first));
+      ++it; // consumes the (wrong) recorded extent
+
+      // A correctly-tracking iterator would now be at element 2; the corrupted extent instead
+      // jumps past the rest of the document, so the traversal ends early. Demonstrates the
+      // failure mode exists - not something a caller should rely on.
+      expect(it == (*doc)["rows"].end());
    };
 };
 

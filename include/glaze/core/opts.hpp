@@ -228,6 +228,30 @@ namespace glz
    // its close, the byte extent is recorded on the document and the next lazy_iterator advance
    // jumps straight past it instead of re-scanning with skip_value_lazy. Costs two size_t on
    // lazy_document when enabled and nothing at all when disabled. See docs/lazy-json.md.
+   //
+   // Only containers are recorded - a read_into that fully consumes a scalar (number, string,
+   // bool, null) does not publish an extent, because there is no closing bracket to check the
+   // reader actually stopped at the value's own end (see lazy_streaming_cursor_scalars below for
+   // the opt-in that trusts it anyway). For a container-of-scalars this means every element still
+   // pays a fresh skip_value_lazy on each advance - which is cheap for genuinely short scalars,
+   // but not free, and on a document that is mostly short scalars separated by short punctuation
+   // it can be the dominant remaining cost. Composes with lazy_general_skip, which speeds up that
+   // remaining scan rather than eliminating it.
+
+   // ---
+   // bool lazy_streaming_cursor_scalars = false;
+   // Extends lazy_streaming_cursor to also record read_into's extent for scalars, not just
+   // containers. Requires lazy_streaming_cursor; has no effect without it.
+   //
+   // This drops the one safety check the container case has (verifying the reader actually
+   // stopped on its own closing bracket) - there is no equivalent single byte to check for a
+   // scalar. It is safe as long as every from<JSON, T> specialization reached through read_into
+   // under this option stops exactly at the value's end on success, which glaze's own num_t/
+   // bool_t/string readers do. It is NOT safe with a custom reader that deliberately consumes
+   // more than one value's worth of input on success - glz::text is the in-tree example, and
+   // reading one through this option will record (and later jump to) the wrong extent. If you
+   // mix custom readers with this option, keep the custom ones off scalars sitting inside a
+   // container you also iterate with the cursor, or leave this option off and pay the rescan.
 
    // ---
    // bool linear_search = false;
@@ -795,6 +819,16 @@ namespace glz
    {
       if constexpr (requires { Opts.lazy_streaming_cursor; }) {
          return Opts.lazy_streaming_cursor;
+      }
+      else {
+         return false;
+      }
+   }
+
+   consteval bool check_lazy_streaming_cursor_scalars(auto&& Opts)
+   {
+      if constexpr (requires { Opts.lazy_streaming_cursor_scalars; }) {
+         return check_lazy_streaming_cursor(Opts) && Opts.lazy_streaming_cursor_scalars;
       }
       else {
          return false;

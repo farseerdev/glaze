@@ -531,16 +531,20 @@ namespace glz
       // is how the cursor turns a well-formed document into a short or mis-valued element
       // stream, with no error anywhere.
       //
-      // So only containers are recorded, and only when the parse finished exactly on the
-      // element's own closing bracket. Scalars are skipped by the cheap paths anyway (a numeric
-      // table walk or a memchr for strings), so declining to record them costs almost nothing
-      // and removes the whole class of doubt.
+      // So by default only containers are recorded, and only when the parse finished exactly on
+      // the element's own closing bracket - there is no equivalent single byte to check for a
+      // scalar, so a scalar is only recorded under the opt-in lazy_streaming_cursor_scalars,
+      // which accepts that narrower guarantee in exchange for not paying a rescan on every scalar
+      // element of a container (see the option's doc comment in opts.hpp for the trade in full).
       void record_consumed_extent(const char* it) const noexcept
       {
          const char open = *data_;
          const char close = (open == '{') ? '}' : ((open == '[') ? ']' : '\0');
          if (close == '\0') {
-            return; // scalar: not worth recording
+            if constexpr (check_lazy_streaming_cursor_scalars(Opts)) {
+               doc_->consumed_.set(doc_->json_data(), data_, it);
+            }
+            return;
          }
          if (it <= data_ || it[-1] != close) {
             return; // the reader stopped somewhere other than this container's end
