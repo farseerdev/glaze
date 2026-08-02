@@ -377,7 +377,24 @@ namespace glz
       explicit operator bool() const noexcept { return !has_error() && data_ && *data_ != 'n'; }
 
       [[nodiscard]] const char* data() const noexcept { return data_; }
+
+      /// @brief The document this view was constructed from, or nullptr for a detached view.
+      /// @note Symmetric getter for the pointer the constructor takes. Lets a caller that stores
+      /// its own copy of a view (rather than always going through the document) recover the
+      /// owning document later - e.g. to resolve document()->root() or reuse consumed_ (see
+      /// lazy_streaming_cursor_policy).
+      [[nodiscard]] const lazy_document<Opts>* document() const noexcept { return doc_; }
+
       [[nodiscard]] const char* json_end() const noexcept;
+
+      /// @brief Rewind this view's own progressive object-scan cursor to the start.
+      /// @note operator[](key) advances parse_pos_ in place so a run of sequential lookups on one
+      /// view stays O(n) total (see the class comment above). lazy_document::reset_parse_pos()
+      /// only rewinds the document's own cached root view; a caller holding an independent copy
+      /// of a *non-root* view (e.g. one element of an array being scanned repeatedly) needs the
+      /// same rewind on that copy, which this provides. One-way reset only, by design - there is
+      /// no setter to an arbitrary position.
+      void reset_parse_pos() const noexcept { parse_pos_ = nullptr; }
 
       /// @brief Get the raw JSON bytes for this value
       /// @return string_view of the raw JSON, or empty if error

@@ -2061,6 +2061,88 @@ suite lazy_streaming_cursor_tests = [] {
 };
 
 // ============================================================================
+// lazy_json_view::document() / reset_parse_pos()
+//
+// A consumer that stores its own copy of a (possibly non-root) view - rather than always
+// re-deriving it from the document - needs a way back to the owning document, and a way to
+// invalidate that copy's own progressive object-scan cursor when starting a fresh pass over it.
+// ============================================================================
+
+suite lazy_view_accessor_tests = [] {
+   "document_recovers_owning_document"_test = [] {
+      const std::string json = R"({"rows":[{"a":1},{"a":2}]})";
+      auto doc = glz::lazy_json(json);
+      expect(doc.has_value());
+
+      auto root = doc->root();
+      expect(root.document() == &*doc);
+
+      // Not just the root - an arbitrary descendant view too.
+      auto rows = (*doc)["rows"];
+      expect(rows.document() == &*doc);
+      auto first = *rows.begin();
+      expect(first.document() == &*doc);
+   };
+
+   "document_is_null_for_detached_view"_test = [] {
+      // A view built directly from a pointer/length rather than through lazy_json() has no
+      // owning document (see the class comment on lazy_json_view's doc_ member).
+      struct bounded_opts : glz::opts
+      {
+         bool null_terminated = false;
+      };
+      const std::string_view json = R"({"a":1})";
+      glz::lazy_json_view<bounded_opts{}> detached{nullptr, json.data()};
+      expect(detached.document() == nullptr);
+   };
+
+   // reset_parse_pos() is a pure performance knob (see the doc comment on the method): the
+   // forward-scan-then-wrap-around search in operator[](key) already finds an earlier key after
+   // the cursor has advanced past it, just by doing an extra failed forward pass first. So the
+   // only thing to pin down here is that the results are identical with and without the reset -
+   // same "can only ever be a speed difference" contract as the cursor/skip options above.
+   "reset_parse_pos_does_not_change_lookup_results"_test = [] {
+      const std::string json = R"({"a":1,"b":2,"c":3,"d":4})";
+
+      auto without_reset = [&] {
+         auto doc = glz::lazy_json(json);
+         auto obj = doc->root();
+         int b{}, a{};
+         expect(not obj["b"].read_into(b)); // advances parse_pos_ past "b"
+         expect(not obj["a"].read_into(a)); // earlier key: forward pass fails, wrap-around finds it
+         return std::pair{a, b};
+      }();
+
+      auto with_reset = [&] {
+         auto doc = glz::lazy_json(json);
+         auto obj = doc->root();
+         int b{}, a{};
+         expect(not obj["b"].read_into(b));
+         obj.reset_parse_pos();
+         expect(not obj["a"].read_into(a)); // reset first: forward pass finds it directly
+         return std::pair{a, b};
+      }();
+
+      expect(with_reset == without_reset);
+      expect(with_reset == std::pair{1, 2});
+   };
+
+   "reset_parse_pos_on_a_copied_non_root_view"_test = [] {
+      // The motivating case: a caller stores its own copy of an element view (not the document's
+      // cached root) and later wants to restart a scan pass over that specific copy.
+      const std::string json = R"({"rows":[{"a":1,"b":2,"c":3}]})";
+      auto doc = glz::lazy_json(json);
+      auto row = *(*doc)["rows"].begin(); // a copy, independent of the document's root view
+
+      int c{}, a{};
+      expect(not row["c"].read_into(c));
+      row.reset_parse_pos();
+      expect(not row["a"].read_into(a));
+      expect(std::pair{a, c} == std::pair{1, 3});
+   };
+};
+
+// ============================================================================
 // Wide number skip (lazy_wide_number_skip)
 // ============================================================================
 
