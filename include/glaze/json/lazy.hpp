@@ -515,7 +515,21 @@ namespace glz
          if constexpr (check_lazy_streaming_cursor(Opts)) {
             // doc_ is null only for detached subviews; lazy_json() views always carry it.
             if (doc_ && consumed_whole_value) [[likely]] {
-               record_consumed_extent(it);
+               if constexpr (check_lazy_streaming_cursor_scalars(Opts) && (num_t<T> || bool_t<T>)) {
+                  // T itself guarantees the JSON shape here: parse<JSON>::op<Opts> for a
+                  // num_t/bool_t T can only have consumed a JSON number/true/false/null, never
+                  // a container, so record_consumed_extent's runtime open-bracket sniff (a
+                  // reload of *data_ plus a branch) is redundant on this path - skip straight
+                  // to the record, matching what record_consumed_extent's own scalar branch
+                  // does, just without re-deriving something the caller's type already knows.
+                  // This is the hottest of the two branches by far (every scalar column read
+                  // goes through it), which is why it gets its own compile-time-selected path
+                  // instead of sharing record_consumed_extent's dynamic dispatch.
+                  doc_->consumed_.set(doc_->json_data(), data_, it);
+               }
+               else {
+                  record_consumed_extent(it);
+               }
             }
          }
          return {};
@@ -536,6 +550,11 @@ namespace glz
       // scalar, so a scalar is only recorded under the opt-in lazy_streaming_cursor_scalars,
       // which accepts that narrower guarantee in exchange for not paying a rescan on every scalar
       // element of a container (see the option's doc comment in opts.hpp for the trade in full).
+      //
+      // read_into<T> takes a compile-time-known-scalar-T fast path above that skips this
+      // function entirely; this dynamic version remains the path for every other T (objects,
+      // strings, arrays, variants, custom readers) where the JSON shape can't be inferred from T
+      // alone.
       void record_consumed_extent(const char* it) const noexcept
       {
          const char open = *data_;
