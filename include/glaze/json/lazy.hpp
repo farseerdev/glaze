@@ -139,6 +139,15 @@ namespace glz
       {
          using enum lazy_char_type;
          while (depth > 0) {
+            // lazy_general_skip: jump straight to the next structural byte before dispatching,
+            // so runs of commas/whitespace/short literals between elements are crossed in one
+            // bounded scan instead of the switch's default case stepping through them one byte
+            // at a time. Semantically a no-op landing spot - see the option's doc comment in
+            // opts.hpp for why any escalation point is safe. Bounded buffers only, same
+            // restriction as lazy_wide_number_skip.
+            if constexpr (!Opts.null_terminated && check_lazy_general_skip(Opts)) {
+               p = find_next_structural(p, end);
+            }
             if constexpr (Opts.null_terminated) {
                if (*p == '\0') break;
             }
@@ -208,6 +217,10 @@ namespace glz
             ++p;
 
             while (depth > 0) {
+               // See the matching comment in skip_to_depth_zero.
+               if constexpr (!Opts.null_terminated && check_lazy_general_skip(Opts)) {
+                  p = find_next_structural(p, end);
+               }
                if constexpr (Opts.null_terminated) {
                   if (*p == '\0') break;
                }

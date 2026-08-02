@@ -104,6 +104,32 @@ struct full_view_opts : glz::opts
 inline constexpr slim_view_opts slim_view{};
 inline constexpr full_view_opts full_view{};
 
+// General skip. Like wide-number-skip, only ever a speed difference; non-null-terminated only.
+struct general_skip_on_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_general_skip = true;
+};
+
+struct general_skip_off_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_general_skip = false;
+};
+
+inline constexpr general_skip_on_opts general_skip_on{};
+inline constexpr general_skip_off_opts general_skip_off{};
+
+// Both escalation options together - independent switches on the same depth-loop dispatch.
+struct general_and_wide_num_on_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_general_skip = true;
+   bool lazy_wide_number_skip = true;
+};
+
+inline constexpr general_and_wide_num_on_opts general_and_wide_num_on{};
+
 struct Cell
 {
    int a{};
@@ -2401,6 +2427,94 @@ suite lazy_wide_number_skip_tests = [] {
 
       const auto on = traverse_raw<wide_num_on>(json);
       const auto off = traverse_raw<wide_num_off>(json);
+      expect(on == off);
+   };
+};
+
+// ============================================================================
+// General skip (lazy_general_skip)
+// ============================================================================
+
+suite lazy_general_skip_tests = [] {
+   // Reuses the wide-number-skip shapes: they already straddle boundary cases (nesting, mixed
+   // strings/numbers/containers, runs immediately before each structural byte), and this option
+   // only changes how fast the same position is reached, never which position - the same
+   // reasoning that makes traverse_raw comparisons valid for wide-number-skip applies here.
+   const std::vector<std::string> shapes{
+      R"({"a":[1,2,3]})",
+      R"({"a":[0,12,"M1",null,0,true,null,null,[0],[0,1,2,3,4,5,6,7,8,9,10,11]]})", // RAMA-shaped row
+      R"({"a":[1234567890123,2345678901234,3456789012345]})",
+      R"({"a":[[1,2],[],[3,4,5]]})",
+      R"({"a":[{"n":1,"m":2},{"n":3,"m":4}]})",
+      R"({"a":[1,"a string, with ] and } inside",2,true,null]})",
+      R"({"a":[]})",
+   };
+
+   "general_skip_matches_disabled"_test = [&] {
+      for (const auto& json : shapes) {
+         const auto on = traverse_raw<general_skip_on>(json);
+         const auto off = traverse_raw<general_skip_off>(json);
+         expect(on == off) << json;
+      }
+   };
+
+   "general_skip_values_are_correct"_test = [&] {
+      expect(traverse_raw<general_skip_on>(shapes[1]) ==
+             R"(0|12|"M1"|null|0|true|null|null|[0]|[0,1,2,3,4,5,6,7,8,9,10,11]|)");
+      expect(traverse_raw<general_skip_on>(shapes[4]) == R"({"n":1,"m":2}|{"n":3,"m":4}|)");
+   };
+
+   "general_skip_reads_agree"_test = [&] {
+      // The skip feeds iteration, so read_into over a row of short mixed cells must land on the
+      // same elements with the option on as with it off - the RAMA-motivating shape.
+      std::string json = R"({"a":[)";
+      for (int i = 0; i < 64; ++i) {
+         if (i) json += ',';
+         json += std::to_string(i);
+      }
+      json += "]}";
+
+      auto sum = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         int64_t total{};
+         int count{};
+         for (auto& e : (*doc)["a"]) {
+            int64_t v{};
+            if (not e.read_into(v)) total += v;
+            if (++count > 128) break;
+         }
+         return std::pair{total, count};
+      };
+
+      const auto on = sum.template operator()<general_skip_on>(json);
+      const auto off = sum.template operator()<general_skip_off>(json);
+      expect(on == off);
+      expect(on.second == 64);
+   };
+
+   "general_skip_composes_with_wide_number_skip"_test = [&] {
+      // Both escalation options are independent switches on the same depth-loop dispatch; a
+      // consumer enabling both must see the same result as either alone.
+      for (const auto& json : shapes) {
+         expect(traverse_raw<general_and_wide_num_on>(json) == traverse_raw<general_skip_off>(json)) << json;
+      }
+   };
+
+   "general_skip_respects_buffer_end"_test = [&] {
+      // A trailing tail past the logical end catches a scan that overran json_end().
+      std::string backing = R"({"a":[1,2,3]}TRAILING99999)";
+      const std::string_view json{backing.data(), backing.find("]}") + 2};
+
+      expect(traverse_raw<general_skip_on>(json) == traverse_raw<general_skip_off>(json));
+      expect(traverse_raw<general_skip_on>(json) == "1|2|3|");
+   };
+
+   "general_skip_truncated_input_terminates"_test = [&] {
+      std::string backing = R"({"a":[1,2,3)";
+      const std::string_view json{backing.data(), backing.size()};
+
+      const auto on = traverse_raw<general_skip_on>(json);
+      const auto off = traverse_raw<general_skip_off>(json);
       expect(on == off);
    };
 };

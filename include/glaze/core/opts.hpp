@@ -212,6 +212,16 @@ namespace glz
    // See docs/lazy-json.md.
 
    // ---
+   // bool lazy_general_skip = false;
+   // Escalates lazy JSON's container-skip loops (skip_value_lazy, skip_to_depth_zero) to jump
+   // straight to the next structural byte (a quote or bracket) via find_next_structural, instead
+   // of stepping through commas, whitespace, short literals and number runs one byte at a time
+   // via the byte-classification switch. Unlike lazy_wide_number_skip (which only escalates
+   // inside a single long numeric run), this applies between elements too, so it also covers runs
+   // of short comma-separated scalars - measure before assuming lazy_wide_number_skip alone
+   // covers your shape. Has no effect unless null_terminated is also false. See docs/lazy-json.md.
+
+   // ---
    // bool lazy_streaming_cursor = false;
    // Lets lazy JSON iteration skip re-scanning values it has already consumed. When a
    // lazy_json_view::read_into fully consumes an element, or a nested container iterator runs to
@@ -755,6 +765,16 @@ namespace glz
    {
       if constexpr (requires { Opts.lazy_slim_view; }) {
          return Opts.lazy_slim_view;
+      }
+      else {
+         return false;
+      }
+   }
+
+   consteval bool check_lazy_general_skip(auto&& Opts)
+   {
+      if constexpr (requires { Opts.lazy_general_skip; }) {
+         return Opts.lazy_general_skip;
       }
       else {
          return false;
