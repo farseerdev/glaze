@@ -317,6 +317,40 @@ namespace glz
 
       template <auto Opts>
       using lazy_extent_for = std::conditional_t<check_lazy_streaming_cursor(Opts), lazy_extent, lazy_extent_disabled>;
+
+      // ============================================================================
+      // Slim view storage (lazy_slim_view option)
+      // ============================================================================
+      //
+      // Pure storage (no behavior) for lazy_json_view's per-value key and error. The key is only
+      // meaningful while iterating an object; the error only tags views returned by a fallible
+      // lookup (operator[], make_error). The full (default) layout holds both on the value. The
+      // slim layout drops them entirely: the key moves onto the iterator (lazy_iter_key below,
+      // since only something that is iterating a container can produce a key to store) and the
+      // error is signalled by a null data_ instead. Empty under GLZ_NO_UNIQUE_ADDRESS when slim.
+      template <bool Slim>
+      struct lazy_view_meta
+      {
+         std::string_view key{};
+         error_code error{error_code::none};
+      };
+
+      template <>
+      struct lazy_view_meta<true>
+      {};
+
+      // Iterator-side key storage: empty under the full layout (the key lives on current_view_,
+      // GLZ_NO_UNIQUE_ADDRESS), a single string_view under the slim layout (the value carries no
+      // key, so the iterator retains the one belonging to the element it is currently on).
+      template <bool Slim>
+      struct lazy_iter_key
+      {};
+
+      template <>
+      struct lazy_iter_key<true>
+      {
+         std::string_view key{};
+      };
    } // namespace detail
 
    // ============================================================================
@@ -331,25 +365,34 @@ namespace glz
     * For objects, parse_pos_ tracks the current scan position to enable
     * efficient sequential key access (O(n) total instead of O(n²)).
     *
-    * Memory layout (48 bytes on 64-bit, 24 bytes on 32-bit):
+    * Memory layout (full, the default - 48 bytes on 64-bit, 24 bytes on 32-bit):
     * - doc_: pointer to document (8/4 bytes)
     * - data_: pointer to value start in JSON (8/4 bytes)
     * - parse_pos_: current scan position for progressive parsing (8/4 bytes)
-    * - key_: stored key for iteration (16/8 bytes - string_view)
-    * - error_: error code (4 bytes)
-    * - padding: 4/0 bytes
+    * - meta_: key (16/8-byte string_view) + error_code + padding (see detail::lazy_view_meta)
+    *
+    * Under lazy_slim_view, meta_ is empty (GLZ_NO_UNIQUE_ADDRESS) and the view is just the three
+    * pointers above - 24 bytes on 64-bit. key() always returns {} (use lazy_iterator::key()
+    * instead while traversing) and errors are signalled by a null data_ rather than a stored code.
     */
    template <auto Opts = opts{}>
    struct lazy_json_view
    {
      private:
+      static constexpr bool slim_ = check_lazy_slim_view(Opts);
+
       const lazy_document<Opts>* doc_{};
       const char* data_{};
       mutable const char* parse_pos_{}; // Current scan position (advances on key access)
-      std::string_view key_{};
-      error_code error_{error_code::none};
+      GLZ_NO_UNIQUE_ADDRESS detail::lazy_view_meta<slim_> meta_{};
 
-      lazy_json_view(error_code ec) noexcept : error_(ec) {}
+      lazy_json_view(error_code ec) noexcept
+      {
+         // Slim: an error view is simply one with a null data_ (the default) - nothing to store.
+         if constexpr (!slim_) {
+            meta_.error = ec;
+         }
+      }
 
      public:
       lazy_json_view() = default;
@@ -357,8 +400,24 @@ namespace glz
 
       [[nodiscard]] static lazy_json_view make_error(error_code ec) noexcept { return lazy_json_view{ec}; }
 
-      [[nodiscard]] bool has_error() const noexcept { return error_ != error_code::none; }
-      [[nodiscard]] error_code error() const noexcept { return error_; }
+      [[nodiscard]] bool has_error() const noexcept
+      {
+         if constexpr (slim_) {
+            return !data_;
+         }
+         else {
+            return meta_.error != error_code::none;
+         }
+      }
+      [[nodiscard]] error_code error() const noexcept
+      {
+         if constexpr (slim_) {
+            return data_ ? error_code::none : error_code::unexpected_end;
+         }
+         else {
+            return meta_.error;
+         }
+      }
 
       // Type checking - direct from JSON byte
       [[nodiscard]] bool is_null() const noexcept { return has_error() || !data_ || *data_ == 'n'; }
@@ -416,7 +475,7 @@ namespace glz
       [[nodiscard]] error_ctx read_into(T& value) const
       {
          if (has_error()) {
-            return error_ctx{0, error_};
+            return error_ctx{0, error()};
          }
          if (!data_) {
             return error_ctx{0, error_code::unexpected_end};
@@ -485,8 +544,17 @@ namespace glz
       [[nodiscard]] size_t size() const;
       [[nodiscard]] bool empty() const noexcept;
 
-      // Key access for object iteration
-      [[nodiscard]] std::string_view key() const noexcept { return key_; }
+      // Key access for object iteration. Under lazy_slim_view the value does not carry its own
+      // key (returns {} always) - use lazy_iterator::key() during traversal instead.
+      [[nodiscard]] std::string_view key() const noexcept
+      {
+         if constexpr (slim_) {
+            return {};
+         }
+         else {
+            return meta_.key;
+         }
+      }
 
       [[nodiscard]] lazy_iterator<Opts> begin() const;
       [[nodiscard]] lazy_iterator<Opts> end() const;
@@ -501,10 +569,15 @@ namespace glz
       friend struct indexed_lazy_view<Opts>;
       friend class indexed_lazy_iterator<Opts>;
 
-      // Constructor with key for iteration
+      // Constructor with key for iteration. Under lazy_slim_view the key is not stored on the
+      // value (it stays on the iterator - see lazy_iterator::iter_key_).
       lazy_json_view(const lazy_document<Opts>* doc, const char* data, std::string_view key) noexcept
-         : doc_(doc), data_(data), key_(key)
-      {}
+         : doc_(doc), data_(data)
+      {
+         if constexpr (!slim_) {
+            meta_.key = key;
+         }
+      }
 
       // Skip whitespace helper
       // Note: The minified option is not used here because branch prediction
@@ -634,6 +707,10 @@ namespace glz
       bool at_end_{true};
       lazy_json_view<Opts> current_view_{}; // Stored view for parse_pos_ optimization
 
+      // lazy_slim_view only: the value no longer carries its own key, so the iterator retains
+      // the current element's key here. Empty (zero-size) under the full layout.
+      GLZ_NO_UNIQUE_ADDRESS detail::lazy_iter_key<check_lazy_slim_view(Opts)> iter_key_{};
+
       // Streaming cursor: on reaching the close, publish this container's own extent so an
       // outer iterator advancing over it can jump too. That is what makes the optimization
       // compose through nesting - an inner loop running to completion pays for the outer
@@ -676,6 +753,19 @@ namespace glz
       // Return reference to stored view - allows parse_pos_ optimization when user uses auto&
       reference operator*() { return current_view_; }
       const lazy_json_view<Opts>& operator*() const { return current_view_; }
+
+      // Current element's object key ({} for arrays). Works under both value layouts: the full
+      // layout reads it back from the stored view, lazy_slim_view from iter_key_ (the value
+      // itself carries no key under that option - see lazy_json_view::key()).
+      [[nodiscard]] std::string_view key() const noexcept
+      {
+         if constexpr (check_lazy_slim_view(Opts)) {
+            return iter_key_.key;
+         }
+         else {
+            return current_view_.key();
+         }
+      }
 
       lazy_iterator& operator++();
 
@@ -1247,8 +1337,12 @@ namespace glz
          at_end_ = true;
          return;
       }
-      // Store key in current_view_ (will be set properly after this call)
+      // Full layout: the key is stored on the view. lazy_slim_view: the view carries no key
+      // (see lazy_json_view::key()), so the iterator retains it in iter_key_ instead.
       current_view_ = lazy_json_view<Opts>{doc_, pos, key};
+      if constexpr (check_lazy_slim_view(Opts)) {
+         iter_key_.key = key;
+      }
    }
 
    template <auto Opts>
@@ -1410,7 +1504,7 @@ namespace glz
    [[nodiscard]] inline expected<T, error_ctx> lazy_json_view<Opts>::get() const
    {
       if (has_error()) {
-         return unexpected(error_ctx{0, error_});
+         return unexpected(error_ctx{0, error()});
       }
 
       const char* end = json_end();

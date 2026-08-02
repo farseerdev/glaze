@@ -89,6 +89,21 @@ struct wide_num_off_opts : glz::opts
 inline constexpr wide_num_on_opts wide_num_on{};
 inline constexpr wide_num_off_opts wide_num_off{};
 
+// Slim view. Changes layout, not behavior - key() moves from the value to the iterator, but
+// every read/lookup result must stay identical.
+struct slim_view_opts : glz::opts
+{
+   bool lazy_slim_view = true;
+};
+
+struct full_view_opts : glz::opts
+{
+   bool lazy_slim_view = false;
+};
+
+inline constexpr slim_view_opts slim_view{};
+inline constexpr full_view_opts full_view{};
+
 struct Cell
 {
    int a{};
@@ -2142,13 +2157,10 @@ suite lazy_view_accessor_tests = [] {
    };
 };
 
-// ============================================================================
-// Wide number skip (lazy_wide_number_skip)
-// ============================================================================
-
-// Renders a full traversal of {"a":[ ... ]} so both option settings can be compared exactly.
+// Renders a full traversal of {"a":[ ... ]} so option/layout variants can be compared exactly.
 // Elements are rendered by raw_json() so container elements and scalars alike are covered, and
-// any misplaced skip shows up as a shifted or truncated slice rather than a silent miscount.
+// any misplaced skip or divergent value shows up as a shifted or truncated slice rather than a
+// silent miscount.
 template <auto Opts>
 std::string traverse_raw(std::string_view json)
 {
@@ -2161,6 +2173,101 @@ std::string traverse_raw(std::string_view json)
    }
    return out;
 }
+
+// ============================================================================
+// Slim view (lazy_slim_view)
+// ============================================================================
+
+suite lazy_slim_view_tests = [] {
+   "slim_view_is_smaller"_test = [] {
+      // The whole point of the option: dropping the per-value key/error storage.
+      expect(sizeof(glz::lazy_json_view<slim_view>) < sizeof(glz::lazy_json_view<full_view>));
+   };
+
+   "slim_view_reads_agree_with_full"_test = [] {
+      // Values, lookups and errors must be identical under both layouts - the option changes
+      // where the key lives, never what a read or lookup returns.
+      const std::vector<std::string> shapes{
+         R"({"a":[1,2,3]})",
+         R"({"a":[{"x":1,"y":"s"},{"x":2,"y":"t"}]})",
+         R"({"a":[[1,2],[3,4,5],[]]})",
+         R"({"a":[]})",
+         R"({"a":[1,"two",3.5,true,null,-6]})",
+      };
+      for (const auto& json : shapes) {
+         expect(traverse_raw<slim_view>(json) == traverse_raw<full_view>(json)) << json;
+      }
+
+      // Object key lookup: the slim value still resolves operator[] correctly even though it
+      // does not store its own key.
+      const std::string obj_json = R"({"a":1,"b":2,"c":3})";
+      auto slim_doc = glz::lazy_json<slim_view>(obj_json);
+      auto full_doc = glz::lazy_json<full_view>(obj_json);
+      int slim_b{}, full_b{};
+      expect(not (*slim_doc)["b"].read_into(slim_b));
+      expect(not (*full_doc)["b"].read_into(full_b));
+      expect(slim_b == full_b);
+      expect(slim_b == 2);
+
+      // A lookup miss must still surface as an error under both layouts. The specific code is
+      // NOT part of the contract under slim - collapsing to a null data_ means every reason
+      // reads back as the same generic code (see error()'s doc comment), where the full layout
+      // keeps whatever make_error() actually set (key_not_found here). Only has_error() agreeing
+      // is guaranteed.
+      auto slim_missing = (*slim_doc)["missing"];
+      auto full_missing = (*full_doc)["missing"];
+      expect(slim_missing.has_error());
+      expect(full_missing.has_error());
+      expect(full_missing.error() == glz::error_code::key_not_found);
+   };
+
+   "slim_view_key_moves_to_the_iterator"_test = [] {
+      // The documented contract: under lazy_slim_view, the dereferenced value's key() is always
+      // {}; the key is only available from the iterator itself during traversal.
+      const std::string json = R"({"a":1,"b":2,"c":3})";
+
+      auto slim_doc = glz::lazy_json<slim_view>(json);
+      std::string slim_keys;
+      for (auto it = slim_doc->root().begin(); it != slim_doc->root().end(); ++it) {
+         expect((*it).key().empty()); // the value itself carries no key
+         slim_keys += it.key(); // the iterator does
+         slim_keys += ',';
+      }
+      expect(slim_keys == "a,b,c,");
+
+      auto full_doc = glz::lazy_json<full_view>(json);
+      std::string full_keys;
+      for (auto& e : full_doc->root()) {
+         full_keys += e.key(); // full layout: the value itself carries it, as before
+         full_keys += ',';
+      }
+      expect(full_keys == slim_keys);
+   };
+
+   "slim_view_copy_survives_detached_from_iterator"_test = [] {
+      // RAMA's motivating case: a caller stores its own copy of a slim view (rather than only
+      // ever dereferencing through a live iterator) and uses it later. Nothing above assumes the
+      // iterator that produced the view is still alive.
+      const std::string json = R"({"rows":[{"a":1,"b":2},{"a":3,"b":4}]})";
+      auto doc = glz::lazy_json<slim_view>(json);
+
+      std::vector<glz::lazy_json_view<slim_view>> saved;
+      for (auto& row : (*doc)["rows"]) {
+         saved.push_back(row); // copy, independent of the iterator
+      }
+      expect(saved.size() == 2);
+
+      int a0{}, a1{};
+      expect(not saved[0]["a"].read_into(a0));
+      expect(not saved[1]["a"].read_into(a1));
+      expect(a0 == 1);
+      expect(a1 == 3);
+   };
+};
+
+// ============================================================================
+// Wide number skip (lazy_wide_number_skip)
+// ============================================================================
 
 suite find_first_of_tests = [] {
    // glz::find_first_of is a shared SWAR primitive, so it is worth pinning down directly rather

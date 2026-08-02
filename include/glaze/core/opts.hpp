@@ -196,6 +196,22 @@ namespace glz
    // own sentinel and takes the plain table walk regardless. See docs/lazy-json.md.
 
    // ---
+   // bool lazy_slim_view = false;
+   // Drops lazy_json_view's per-value key/error storage (16+ bytes), shrinking the view from 48
+   // to 24 bytes on 64-bit. The key is only meaningful while iterating an object and the error
+   // only tags views returned by fallible lookups - a consumer that never stores those on the
+   // value itself (keys looked up by name, errors surfaced from read_into's return) does not pay
+   // for them. Under this option lazy_json_view::key() always returns {} - use
+   // lazy_iterator::key() during traversal instead, since the key moves there. has_error() and
+   // whether a read/lookup succeeds are unaffected; error() is - a slim view has no stored error
+   // code, only a null-vs-non-null data pointer, so every failure reason (wrong type, key not
+   // found, truncated input, ...) reads back as the same generic code instead of the specific one
+   // the full layout would report.
+   // Aimed at consumers that copy the view itself into their own storage per element (rather than
+   // re-deriving it from the document each access), where the smaller view is less to copy.
+   // See docs/lazy-json.md.
+
+   // ---
    // bool lazy_streaming_cursor = false;
    // Lets lazy JSON iteration skip re-scanning values it has already consumed. When a
    // lazy_json_view::read_into fully consumes an element, or a nested container iterator runs to
@@ -729,6 +745,16 @@ namespace glz
    {
       if constexpr (requires { Opts.assume_sufficient_buffer; }) {
          return Opts.assume_sufficient_buffer;
+      }
+      else {
+         return false;
+      }
+   }
+
+   consteval bool check_lazy_slim_view(auto&& Opts)
+   {
+      if constexpr (requires { Opts.lazy_slim_view; }) {
+         return Opts.lazy_slim_view;
       }
       else {
          return false;
