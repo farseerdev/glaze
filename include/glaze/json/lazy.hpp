@@ -112,7 +112,10 @@ namespace glz
 #if defined(__clang__) || defined(__GNUC__)
          if (!std::is_constant_evaluated()) {
             using vbytes = unsigned char __attribute__((vector_size(32)));
-            while (p + 32 <= end) {
+            // end - p rather than p + 32 <= end: the latter forms a pointer past
+            // one-past-the-end for short ranges, diagnosable UB on a null range (see
+            // find_first_of's identical comment in glaze/util/parse.hpp).
+            while (end - p >= 32) {
                vbytes chunk;
                std::memcpy(&chunk, p, sizeof(chunk));
                const vbytes hits =
