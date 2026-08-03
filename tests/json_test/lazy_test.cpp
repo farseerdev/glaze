@@ -2614,29 +2614,56 @@ suite lazy_general_skip_tests = [] {
    // BOTH (a) end-p >= 32 at loop entry, so the scan window is opened at all, AND (b) the next
    // structural byte falls within the first 32 bytes scanned - otherwise the loop advances past
    // it (p += 32) and the byte is found by the SWAR fallback instead, silently bypassing the
-   // wide path entirely despite the buffer being "long enough". Every shape earlier in this
-   // suite fails (a); a naively "long" shape can still fail (b) if its structural terminator
-   // sits past byte 32 of the scan (e.g. a 50-byte gap with nothing after it: end-p==gap, so
-   // the terminator is never inside a scanned chunk - it is found by the SWAR remainder, same
-   // as if the option were off). This document keeps the array's ']' inside the first 17 bytes
-   // of the scan while padding the rest of the buffer past byte 32, so (a) and (b) both hold -
-   // a document-shape census on RAMA's own mlinar fixture found only ~8.5% of real
-   // structural-byte gaps reach 32 bytes, so getting this construction right matters for
-   // whether the wide path is exercised on real data too. Without this test, "136/136 passed"
-   // is not evidence the 32-byte block is correct, only that it never ran - the exact failure
-   // mode #2746's own adversarial review caught elsewhere in this file (a dropped character
-   // left 517 assertions passing while silently miscounting depth).
+   // wide path entirely despite the buffer being "long enough".
+   //
+   // Getting (a) and (b) to hold is not enough on its own to *discriminate* a broken wide scan,
+   // though: traverse_raw's for-loop reads each top-level array element with the ordinary JSON
+   // parser (not a skip), so a flat array's own closing ']' is never located via
+   // find_next_structural at all - only skip_value_lazy's container case (find_next_structural
+   // inside skip_to_depth_zero, when computing a *nested* container element's raw_json() span)
+   // actually escalates through this path. An earlier version of this test used a flat array and
+   // passed the (a)/(b) offset checks, but a targeted break (dropping ']' from the wide fold)
+   // still passed it silently: with the closing ']' invisible, the scan lands on the very next
+   // structural byte instead (here, a sibling key's opening quote 2 bytes later, still inside the
+   // same chunk) and the depth-tracking dispatch (case quote: skip_string_fast, harmless) happens
+   // to recover the same output regardless - the miss produces no visible difference on that
+   // shape. Confirmed instead by 5 *other* pre-existing tests in this suite going red under the
+   // same break (see the coverage-gap writeup in the branch's working notes).
+   //
+   // This document exercises the actual escalating path (a nested array as a *single element* of
+   // "a", so its raw_json() span is computed via skip_value_lazy's '[' case) and additionally
+   // pushes every structural byte *other* than the nested array's own ']' out past offset 32 from
+   // p (the outer ']' and the object's final '}' both land past byte 32, via a second, long
+   // sibling-element digit run after the nested array). A scan that drops ']' from its character
+   // set therefore finds *zero* hits in the first chunk (nothing else in [0,32) is structural),
+   // advances a full 32 bytes blind, and then - even via the untouched SWAR fallback - lands on
+   // the real but *wrong* closing bracket (the outer ']', not the inner one), which
+   // skip_to_depth_zero's dispatch treats identically (case close: --depth) regardless of which
+   // bracket type it is. That yields a visibly corrupted raw_json() span for the nested array
+   // (spilling into its sibling element and the outer ']'), which this test's exact-match
+   // assertion below catches directly - verified red-then-green against a targeted break in the
+   // wide fold before this comment was written.
    "general_skip_wide_gap_exercises_32byte_scan"_test = [&] {
-      const std::string json = R"({"a":[1,2,3,4,5,6,7,8,9],"pad":")" + std::string(40, 'x') + R"("})";
-      const size_t p = json.find('[') + 1;
-      const size_t close = json.find(']');
-      expect(close - p < 32) << "']' must fall within the first 32-byte scan window";
+      std::string inner;
+      for (int i = 1; i <= 12; ++i) {
+         if (i > 1) inner += ',';
+         inner += std::to_string(i);
+      }
+      const std::string json = R"({"a":[[)" + inner + R"(],9999999999]})";
+
+      const size_t p = json.find("[[") + 2;
+      const size_t inner_close = json.find(']');
+      const size_t outer_close = json.find(']', inner_close + 1);
+      expect(inner_close - p < 32) << "the nested array's own ']' must fall inside the first 32-byte scan window";
+      expect(outer_close - p >= 32)
+         << "the outer ']' (and '}') must fall outside that window - otherwise a scan that misses the inner "
+            "']' can mask the miss by landing on one of those within the same chunk instead";
       expect(json.size() - p >= 32) << "buffer must be long enough for the scan to enter its loop";
 
       const auto on = traverse_raw<general_skip_on>(json);
       const auto off = traverse_raw<general_skip_off>(json);
       expect(on == off) << json;
-      expect(on == "1|2|3|4|5|6|7|8|9|");
+      expect(on == "[1,2,3,4,5,6,7,8,9,10,11,12]|9999999999|");
    };
 };
 
