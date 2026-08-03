@@ -107,7 +107,9 @@ namespace glz
       // iterations 4x before falling back to find_first_of's 8-byte SWAR loop for the remainder.
       // MSVC's cl.exe lacks vector extensions, so it falls straight through to find_first_of
       // (this project builds with clang-cl, which does support them).
-      GLZ_ALWAYS_INLINE const char* find_next_structural(const char* p, const char* end) noexcept
+      template <size_t... I>
+      GLZ_ALWAYS_INLINE const char* find_next_structural_wide(const char* p, const char* end,
+                                                               std::index_sequence<I...>) noexcept
       {
 #if defined(__clang__) || defined(__GNUC__)
          if (!std::is_constant_evaluated()) {
@@ -118,8 +120,13 @@ namespace glz
             while (end - p >= 32) {
                vbytes chunk;
                std::memcpy(&chunk, p, sizeof(chunk));
-               const vbytes hits =
-                  (chunk == '"') | (chunk == '[') | (chunk == ']') | (chunk == '{') | (chunk == '}');
+               // Expanded from lazy_structural_chars (fold over I...), not hardcoded literals -
+               // this must stay in lockstep with find_next_structural_swar's character set, which
+               // is exactly what the static_assert below checks against lazy_char_class. A
+               // hardcoded set here would silently drift from that assert's guarantee if
+               // lazy_structural_chars ever changed - the same class of bug #2746's adversarial
+               // review found and fixed with the static_assert in the first place.
+               const vbytes hits = ((chunk == lazy_structural_chars[I]) | ...);
                std::uint64_t words[4];
                std::memcpy(words, &hits, sizeof(words));
                for (int w = 0; w < 4; ++w) {
@@ -135,7 +142,12 @@ namespace glz
             }
          }
 #endif
-         return find_next_structural_swar(p, end, std::make_index_sequence<lazy_structural_chars.size()>{});
+         return find_next_structural_swar(p, end, std::index_sequence<I...>{});
+      }
+
+      GLZ_ALWAYS_INLINE const char* find_next_structural(const char* p, const char* end) noexcept
+      {
+         return find_next_structural_wide(p, end, std::make_index_sequence<lazy_structural_chars.size()>{});
       }
 
       static_assert(
