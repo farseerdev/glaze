@@ -2609,6 +2609,30 @@ suite lazy_general_skip_tests = [] {
       const auto off = traverse_raw<general_skip_off>(json);
       expect(on == off);
    };
+
+   // find_next_structural's 32-byte vector-extension pass (clang/gcc only) only runs when the
+   // gap to the next structural byte is >= 32 bytes; every shape above is far shorter, so none
+   // of them exercise it - a document-shape census on RAMA's own mlinar fixture found only
+   // ~8.5% of real structural-byte gaps ever reach that length, and every hand-written shape
+   // in this suite up to this point is well under it too. Without this test, "136/136 passed"
+   // would not actually be evidence the 32-byte block is correct, only that it never ran -
+   // the exact failure mode #2746's own adversarial review caught (a dropped character left
+   // 517 assertions passing while silently miscounting depth). This shape's numeric run between
+   // '[' and ']' is 50 bytes, comfortably over the 32-byte threshold.
+   "general_skip_wide_gap_exercises_32byte_scan"_test = [&] {
+      std::string json = R"({"a":[)";
+      for (int i = 1; i <= 20; ++i) {
+         if (i > 1) json += ',';
+         json += std::to_string(i);
+      }
+      json += "]}";
+      expect(json.size() - json.find('[') - json.find(']') > 0); // sanity: gap exists
+
+      const auto on = traverse_raw<general_skip_on>(json);
+      const auto off = traverse_raw<general_skip_off>(json);
+      expect(on == off) << json;
+      expect(on == "1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|");
+   };
 };
 
 // The shapes every writer test runs over. Each string is a complete document, so writing its
