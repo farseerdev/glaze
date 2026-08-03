@@ -2610,28 +2610,33 @@ suite lazy_general_skip_tests = [] {
       expect(on == off);
    };
 
-   // find_next_structural's 32-byte vector-extension pass (clang/gcc only) only runs when the
-   // gap to the next structural byte is >= 32 bytes; every shape above is far shorter, so none
-   // of them exercise it - a document-shape census on RAMA's own mlinar fixture found only
-   // ~8.5% of real structural-byte gaps ever reach that length, and every hand-written shape
-   // in this suite up to this point is well under it too. Without this test, "136/136 passed"
-   // would not actually be evidence the 32-byte block is correct, only that it never ran -
-   // the exact failure mode #2746's own adversarial review caught (a dropped character left
-   // 517 assertions passing while silently miscounting depth). This shape's numeric run between
-   // '[' and ']' is 50 bytes, comfortably over the 32-byte threshold.
+   // find_next_structural's 32-byte vector-extension pass (clang/gcc only) only fires when
+   // BOTH (a) end-p >= 32 at loop entry, so the scan window is opened at all, AND (b) the next
+   // structural byte falls within the first 32 bytes scanned - otherwise the loop advances past
+   // it (p += 32) and the byte is found by the SWAR fallback instead, silently bypassing the
+   // wide path entirely despite the buffer being "long enough". Every shape earlier in this
+   // suite fails (a); a naively "long" shape can still fail (b) if its structural terminator
+   // sits past byte 32 of the scan (e.g. a 50-byte gap with nothing after it: end-p==gap, so
+   // the terminator is never inside a scanned chunk - it is found by the SWAR remainder, same
+   // as if the option were off). This document keeps the array's ']' inside the first 17 bytes
+   // of the scan while padding the rest of the buffer past byte 32, so (a) and (b) both hold -
+   // a document-shape census on RAMA's own mlinar fixture found only ~8.5% of real
+   // structural-byte gaps reach 32 bytes, so getting this construction right matters for
+   // whether the wide path is exercised on real data too. Without this test, "136/136 passed"
+   // is not evidence the 32-byte block is correct, only that it never ran - the exact failure
+   // mode #2746's own adversarial review caught elsewhere in this file (a dropped character
+   // left 517 assertions passing while silently miscounting depth).
    "general_skip_wide_gap_exercises_32byte_scan"_test = [&] {
-      std::string json = R"({"a":[)";
-      for (int i = 1; i <= 20; ++i) {
-         if (i > 1) json += ',';
-         json += std::to_string(i);
-      }
-      json += "]}";
-      expect(json.size() - json.find('[') - json.find(']') > 0); // sanity: gap exists
+      const std::string json = R"({"a":[1,2,3,4,5,6,7,8,9],"pad":")" + std::string(40, 'x') + R"("})";
+      const size_t p = json.find('[') + 1;
+      const size_t close = json.find(']');
+      expect(close - p < 32) << "']' must fall within the first 32-byte scan window";
+      expect(json.size() - p >= 32) << "buffer must be long enough for the scan to enter its loop";
 
       const auto on = traverse_raw<general_skip_on>(json);
       const auto off = traverse_raw<general_skip_off>(json);
       expect(on == off) << json;
-      expect(on == "1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|");
+      expect(on == "1|2|3|4|5|6|7|8|9|");
    };
 };
 
