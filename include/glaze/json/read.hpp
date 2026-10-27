@@ -44,8 +44,11 @@ namespace glz
    template <>
    struct parse<JSON>
    {
+      // `end` is taken by reference: in streaming mode a read may refill the buffer, and
+      // the caller's `end` then follows the refilled data instead of going stale. A
+      // number, bool or string never refills, so reading one costs nothing extra.
       template <auto Opts, class T, is_context Ctx, class It0, class It1>
-      GLZ_ALWAYS_INLINE static void op(T&& value, Ctx&& ctx, It0&& it, It1 end)
+      GLZ_ALWAYS_INLINE static void op(T&& value, Ctx&& ctx, It0&& it, It1&& end)
       {
          if constexpr (const_value_v<T>) {
             if constexpr (check_error_on_const_read(Opts)) {
@@ -60,6 +63,9 @@ namespace glz
             using V = std::remove_cvref_t<T>;
             from<JSON, V>::template op<Opts>(std::forward<T>(value), std::forward<Ctx>(ctx), std::forward<It0>(it),
                                              end);
+            if constexpr (!(num_t<V> || bool_t<V> || str_t<V>)) {
+               sync_stream_end(ctx, end);
+            }
          }
       }
 
@@ -2160,6 +2166,12 @@ namespace glz
       template <auto Opts>
       GLZ_ALWAYS_INLINE static void op(auto&& value, is_context auto&& ctx, auto&& it, auto end)
       {
+         if constexpr (has_streaming_state<decltype(ctx)>) {
+            if (ctx.stream.enabled()) {
+               read_streaming<Opts>(value, ctx, it, end);
+               return;
+            }
+         }
          auto it_start = it;
          if (*it == 'n') {
             match<"null", Opts>(ctx, it, end);
@@ -2173,6 +2185,35 @@ namespace glz
          if (bool(ctx.error)) [[unlikely]]
             return;
          value.str = {it_start, static_cast<size_t>(it - it_start)};
+      }
+
+     private:
+      // A refill moves the buffered data, so the value's text cannot be a view of the
+      // buffer once the value crosses one: an owning string collects the pieces as they
+      // leave the buffer; a non-owning one reports feature_not_supported instead of
+      // pointing at bytes that were overwritten.
+      template <auto Opts>
+      static void read_streaming(auto&& value, is_context auto&& ctx, auto&& it, auto end)
+      {
+         if constexpr (requires { value.str.append(std::string_view{}); }) {
+            value.str.clear();
+            skip_value_streaming<Opts>(ctx, it, end, [&](std::string_view const piece) { value.str.append(piece); });
+         }
+         else {
+            size_t pieces = 0;
+            std::string_view text;
+            skip_value_streaming<Opts>(ctx, it, end, [&](std::string_view const piece) {
+               ++pieces;
+               text = piece;
+            });
+            if (bool(ctx.error)) [[unlikely]]
+               return;
+            if (pieces != 1) [[unlikely]] {
+               ctx.error = error_code::feature_not_supported;
+               return;
+            }
+            value.str = {text.data(), text.size()};
+         }
       }
    };
 
@@ -2382,6 +2423,7 @@ namespace glz
                   // Streaming refill point: after parsing each element, refill if buffer is low
                   if constexpr (has_streaming_state<decltype(ctx)>) {
                      if (ctx.stream.enabled()) {
+                        sync_stream_end(ctx, end); // the element may have refilled
                         const size_t consumed = static_cast<size_t>(it - ctx.stream.data());
                         // Refill when less than 25% of buffer remains to ensure enough space for next element
                         if (ctx.stream.size() - consumed <= ctx.stream.size() / 4 || it >= end) {
@@ -3425,6 +3467,7 @@ namespace glz
                // Streaming refill point: after parsing each key-value pair, refill if buffer is low
                if constexpr (has_streaming_state<decltype(ctx)>) {
                   if (ctx.stream.enabled()) {
+                     sync_stream_end(ctx, end); // the value (or a skip of it) may have refilled
                      const size_t consumed = static_cast<size_t>(it - ctx.stream.data());
                      // Refill when less than 25% of buffer remains to ensure enough space for next element
                      if (ctx.stream.size() - consumed <= ctx.stream.size() / 4 || it >= end) {

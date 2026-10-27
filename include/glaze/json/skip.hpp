@@ -11,9 +11,11 @@ namespace glz
    template <>
    struct skip_value<JSON>
    {
+      // `end` is taken by reference: a streaming skip refills the buffer, and the caller's
+      // `end` then follows the refilled data instead of going stale.
       template <auto Opts>
          requires(not Opts.comments)
-      GLZ_ALWAYS_INLINE static void op(is_context auto&& ctx, auto&& it, auto end) noexcept;
+      GLZ_ALWAYS_INLINE static void op(is_context auto&& ctx, auto&& it, auto&& end) noexcept;
 
       template <auto Opts>
          requires(bool(Opts.comments))
@@ -188,20 +190,39 @@ namespace glz
    // nesting state is tracked across refills, so skipped values may be
    // arbitrarily larger than the buffer (e.g. unknown keys holding large arrays).
    // Skipped bytes are consumed and not validated, matching the non-validating
-   // skip path. After this returns, the caller's `end` may be stale; callers
-   // resynchronize iterators at their streaming refill checkpoints.
-   template <auto Opts>
-      requires(not Opts.comments)
-   void skip_value_streaming(is_context auto&& ctx, auto&& it, auto end) noexcept
+   // skip path. `end` follows the refilled data when the caller's `end` is
+   // assignable. `keep` is handed the skipped value's bytes as they leave the
+   // buffer: each piece before a refill, the rest once the value ends (nothing
+   // after an error) - what a reader that keeps the value's text needs.
+   struct skip_keep_nothing
    {
+      void operator()(std::string_view) const noexcept {}
+   };
+
+   template <auto Opts, class Keep = skip_keep_nothing>
+      requires(not Opts.comments)
+   void skip_value_streaming(is_context auto&& ctx, auto&& it, auto&& caller_end, Keep&& keep = {}) noexcept
+   {
+      const char* end = caller_end;
+      const char* kept_from = nullptr; // start of the value bytes not yet handed to `keep`
       const auto refill = [&]() -> bool {
+         if (kept_from) {
+            keep(std::string_view{kept_from, static_cast<size_t>(it - kept_from)});
+         }
          const size_t consumed = static_cast<size_t>(it - ctx.stream.data());
          const char* new_it;
          const char* new_end;
          ctx.stream.consume_and_refill(consumed, new_it, new_end);
          it = new_it;
          end = new_end;
+         if constexpr (requires { caller_end = new_end; }) {
+            caller_end = new_end;
+         }
+         kept_from = kept_from ? new_it : nullptr;
          return it < end;
+      };
+      const auto finish = [&] {
+         keep(std::string_view{kept_from, static_cast<size_t>(it - kept_from)});
       };
 
       // Skip leading whitespace, refilling as needed
@@ -216,6 +237,7 @@ namespace glz
          }
       }
 
+      kept_from = it;
       const char open = *it;
       if (open == '{' || open == '[') {
          ++it;
@@ -301,6 +323,7 @@ namespace glz
             ++it;
          }
       }
+      finish();
    }
 
    // parse_value is used for JSON pointer reading
@@ -321,7 +344,7 @@ namespace glz
 
    template <auto Opts>
       requires(not Opts.comments)
-   GLZ_ALWAYS_INLINE void skip_value<JSON>::op(is_context auto&& ctx, auto&& it, auto end) noexcept
+   GLZ_ALWAYS_INLINE void skip_value<JSON>::op(is_context auto&& ctx, auto&& it, auto&& end) noexcept
    {
       using namespace glz::detail;
 
