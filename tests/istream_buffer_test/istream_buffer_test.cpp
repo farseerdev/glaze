@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -4078,6 +4079,306 @@ suite additional_edge_cases = [] {
       expect(!ec);
       expect(r.id == 42);
       expect(r.name == "test");
+   };
+};
+
+// ============================================================================
+// Values read across a refill: raw text and the caller's end
+// ============================================================================
+
+struct raw_member_record
+{
+   std::string a{};
+   glz::raw_json meta{};
+   int b{};
+};
+
+struct raw_view_record
+{
+   std::string a{};
+   glz::raw_json_view meta{};
+   int b{};
+};
+
+struct unknown_raw_record
+{
+   int id{};
+   std::map<std::string, glz::raw_json> extra{};
+};
+
+template <>
+struct glz::meta<unknown_raw_record>
+{
+   using T = unknown_raw_record;
+   static constexpr auto value = object("id", &T::id);
+   static constexpr auto unknown_read = &T::extra;
+};
+
+struct skipped_member_record
+{
+   int x{};
+   int y{};
+};
+
+// A reader of its own over {"first": <large>, "after": N}: the first value is
+// skipped with glaze's skip, or read into a vector by glaze's array reader -
+// either refills - and the reader goes on with the same `end`, which must
+// follow the refilled data. Before the next key it refills when the buffer
+// runs low, as glaze's own loops do.
+template <bool Skip>
+struct first_then_after
+{
+   std::vector<std::variant<int, std::string>> first{};
+   int after{};
+   bool end_followed{}; // after the first value, `end` was where the buffered data ends
+};
+
+template <class Ctx, class It, class End>
+void refill_point(Ctx& ctx, It& it, End& end)
+{
+   if constexpr (glz::has_streaming_state<Ctx>) {
+      if (ctx.stream.enabled()) {
+         const size_t consumed = static_cast<size_t>(it - ctx.stream.data());
+         if (ctx.stream.size() - consumed <= ctx.stream.size() / 2 || it >= end) {
+            const char* new_it;
+            const char* new_end;
+            ctx.stream.consume_and_refill(consumed, new_it, new_end);
+            it = new_it;
+            end = new_end;
+         }
+      }
+   }
+}
+
+template <bool Skip>
+struct glz::from<glz::JSON, first_then_after<Skip>>
+{
+   template <auto Opts>
+   static void op(first_then_after<Skip>& value, is_context auto&& ctx, auto&& it, auto end)
+   {
+      const auto expect_char = [&](char const c) {
+         if (skip_ws<Opts>(ctx, it, end)) return false;
+         if (*it != c) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         ++it;
+         return true;
+      };
+      std::string key;
+      if (!expect_char('{') || skip_ws<Opts>(ctx, it, end)) return;
+      parse<JSON>::op<Opts>(key, ctx, it, end);
+      if (bool(ctx.error) || parse_ws_colon<Opts>(ctx, it, end)) return;
+      if constexpr (Skip) {
+         skip_value<JSON>::op<Opts>(ctx, it, end);
+      }
+      else {
+         parse<JSON>::op<Opts>(value.first, ctx, it, end);
+      }
+      if constexpr (has_streaming_state<decltype(ctx)>) {
+         value.end_followed = end == ctx.stream.data() + ctx.stream.size();
+      }
+      if (bool(ctx.error)) return;
+      refill_point(ctx, it, end);
+      if (!expect_char(',') || skip_ws<Opts>(ctx, it, end)) return;
+      parse<JSON>::op<Opts>(key, ctx, it, end);
+      if (bool(ctx.error) || parse_ws_colon<Opts>(ctx, it, end)) return;
+      parse<JSON>::op<Opts>(value.after, ctx, it, end);
+      if (bool(ctx.error)) return;
+      if (!expect_char('}')) {
+         if (!bool(ctx.error) || ctx.error == error_code::end_reached) ctx.error = error_code::unexpected_end;
+      }
+   }
+};
+
+namespace
+{
+   std::string large_array(size_t const count)
+   {
+      std::string json{"["};
+      for (size_t i = 0; i < count; ++i) {
+         json += std::to_string(i) + ",\"s\\\"" + std::to_string(i) + "\",";
+      }
+      json += "0]";
+      return json;
+   }
+}
+
+// A buffer over a source that hands out at most `chunk` bytes per read, as a
+// socket or a decompressor does; a refill reads until the buffer is full.
+struct chunk_window
+{
+   std::string_view source{};
+   size_t chunk{};
+   std::vector<char> storage = std::vector<char>(512);
+   size_t source_pos{};
+   size_t read_pos{};
+   size_t data_end{};
+   size_t total{};
+   bool source_done{};
+
+   const char* data() const noexcept { return storage.data() + read_pos; }
+   size_t size() const noexcept { return data_end - read_pos; }
+   bool empty() const noexcept { return size() == 0; }
+   bool eof() const noexcept { return source_done && empty(); }
+   void consume(size_t const n) noexcept
+   {
+      read_pos += n;
+      total += n;
+   }
+   size_t bytes_consumed() const noexcept { return total; }
+   bool refill()
+   {
+      const size_t remaining = size();
+      std::memmove(storage.data(), storage.data() + read_pos, remaining);
+      read_pos = 0;
+      data_end = remaining;
+      while (data_end < storage.size() && source_pos < source.size()) {
+         const size_t n = (std::min)({chunk, storage.size() - data_end, source.size() - source_pos});
+         std::memcpy(storage.data() + data_end, source.data() + source_pos, n);
+         source_pos += n;
+         data_end += n;
+      }
+      source_done = source_pos == source.size();
+      return size() > 0;
+   }
+};
+
+template <>
+struct glz::buffer_traits<chunk_window>
+{
+   static constexpr bool is_resizable = false;
+   static constexpr bool has_bounded_capacity = false;
+   static constexpr bool is_output_streaming = false;
+   static constexpr bool is_input_streaming = true;
+   static size_t capacity(const chunk_window& b) noexcept { return b.size(); }
+   static bool ensure_capacity(chunk_window&, size_t) noexcept { return true; }
+   static void finalize(chunk_window&, size_t) noexcept {}
+   static void flush(chunk_window&, size_t) noexcept {}
+   static bool refill(chunk_window& b) { return b.refill(); }
+   static void consume(chunk_window& b, size_t const n) noexcept { b.consume(n); }
+   static size_t bytes_consumed(const chunk_window& b) noexcept { return b.bytes_consumed(); }
+};
+
+namespace
+{
+   constexpr glz::opts refill_test_opts{.null_terminated = false, .error_on_unknown_keys = false};
+
+   template <class T>
+   glz::error_ctx read_chunked(T& value, const std::string& json, size_t const chunk)
+   {
+      chunk_window buffer{.source = json, .chunk = chunk};
+      return glz::read_streaming<refill_test_opts>(value, buffer);
+   }
+
+   template <class T>
+   glz::error_ctx read_whole(T& value, const std::string& json)
+   {
+      return glz::read<refill_test_opts>(value, std::string_view{json});
+   }
+
+   // Through refills near the end of the input less data is buffered than before
+   // them, so an `end` gone stale reaches past the data into bytes left over from
+   // earlier contents. Whatever the input, a read through refills must end as a
+   // read of the same text in one buffer does - an error for a truncated text
+   // (not necessarily the same one), the same value for a complete one: every
+   // cut near the end is tried.
+   template <class T>
+   void expect_streamed_reads_as_whole(std::string const& head, std::string const& tail, auto&& same_value)
+   {
+      for (size_t pad = 0; pad < 160; ++pad) {
+         std::string const json = head + large_array(pad) + tail;
+         for (size_t cut = json.size() - tail.size() - 2; cut <= json.size(); ++cut) {
+            auto const text = json.substr(0, cut);
+            T streamed{}, whole{};
+            auto const s_ec = read_chunked(streamed, text, 7);
+            auto const w_ec = read_whole(whole, text);
+            expect(bool(s_ec) == bool(w_ec) && (bool(w_ec) || same_value(streamed, whole)))
+               << "pad " << pad << " cut " << cut << ": " << glz::format_error(s_ec.ec) << " vs "
+               << glz::format_error(w_ec.ec);
+         }
+      }
+   }
+}
+
+suite streaming_refill_across_value_tests = [] {
+   "raw_json keeps a value that crosses refills"_test = [] {
+      auto const meta = large_array(300);
+      std::string const json = R"({"a":"x","meta":)" + meta + R"(,"b":5})";
+      for (size_t const chunk : {1u, 7u, 64u, 4096u}) {
+         raw_member_record r;
+         auto const ec = read_chunked(r, json, chunk);
+         expect(!ec) << glz::format_error(ec, json);
+         expect(r.meta.str == meta);
+         expect(r.b == 5);
+      }
+   };
+
+   "raw_json_view crossing a refill is an error, not a dangling view"_test = [] {
+      std::string const json = R"({"a":"x","meta":)" + large_array(300) + R"(,"b":5})";
+      raw_view_record r;
+      auto const ec = read_chunked(r, json, 7);
+      expect(ec.ec == glz::error_code::feature_not_supported);
+   };
+
+   "raw_json_view within the buffer is a view of it"_test = [] {
+      std::string const json = R"({"a":"x","meta":[1,2,3],"b":5})";
+      raw_view_record r;
+      chunk_window buffer{.source = json, .chunk = 4096}; // outlives the view
+      auto const ec = glz::read_streaming<refill_test_opts>(r, buffer);
+      expect(!ec);
+      expect(std::string_view{r.meta.str} == "[1,2,3]");
+      expect(r.b == 5);
+   };
+
+   "unknown keys read into raw_json cross refills intact"_test = [] {
+      auto const big = large_array(300);
+      std::string const json = R"({"id":1,"first":)" + big + R"(,"second":{"k":[true,null,"v"]},"third":42})";
+      for (size_t const chunk : {1u, 7u, 4096u}) {
+         unknown_raw_record r;
+         auto const ec = read_chunked(r, json, chunk);
+         expect(!ec) << glz::format_error(ec, json);
+         expect(r.id == 1);
+         expect(r.extra["first"].str == big);
+         expect(r.extra["second"].str == R"({"k":[true,null,"v"]})");
+         expect(r.extra["third"].str == "42");
+      }
+   };
+
+   "elements after a refilling skip read as from one buffer"_test = [] {
+      expect_streamed_reads_as_whole<std::vector<skipped_member_record>>(
+         R"([{"x":1,"pad":)", R"(,"y":2},{"x":3,"y":4}])", [](auto const& s, auto const& w) {
+            bool same{s.size() == w.size()};
+            for (size_t i = 0; same && i < w.size(); ++i) {
+               same = s[i].x == w[i].x && s[i].y == w[i].y;
+            }
+            return same;
+         });
+   };
+
+   "a reader of its own after skip_value reads as from one buffer"_test = [] {
+      expect_streamed_reads_as_whole<first_then_after<true>>(
+         R"({"first":)", R"(,"after":7})", [](auto const& s, auto const& w) { return s.after == w.after; });
+   };
+
+   "a reader of its own after an array read reads as from one buffer"_test = [] {
+      expect_streamed_reads_as_whole<first_then_after<false>>(
+         R"({"first":)", R"(,"after":7})",
+         [](auto const& s, auto const& w) { return s.after == w.after && s.first == w.first; });
+   };
+
+   "after a refilling read the caller's end is where the data ends"_test = [] {
+      // The refills run up to the end of the input, where less data is buffered
+      // than before the last one.
+      for (size_t const pad : {100u, 300u}) {
+         std::string const json = R"({"first":)" + large_array(pad) + R"(,"after":7})";
+         first_then_after<true> skipped;
+         auto ec = read_chunked(skipped, json, 7);
+         expect(!ec && skipped.after == 7 && skipped.end_followed) << glz::format_error(ec, json);
+         first_then_after<false> read;
+         ec = read_chunked(read, json, 7);
+         expect(!ec && read.after == 7 && read.end_followed) << glz::format_error(ec, json);
+      }
    };
 };
 

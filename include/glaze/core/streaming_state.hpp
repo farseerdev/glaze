@@ -94,4 +94,17 @@ namespace glz
    concept has_streaming_state = is_context<std::remove_cvref_t<T>> && requires(std::remove_cvref_t<T>& ctx) {
       { ctx.stream } -> std::same_as<streaming_state&>;
    };
+
+   // Re-derives `end` from the stream after a read that may have refilled the buffer:
+   // the type-specific readers take `end` by value, so after a refill the caller's copy
+   // no longer marks where the buffered data ends. A no-op without streaming.
+   template <class Ctx, class End>
+   inline void sync_stream_end(Ctx& ctx, End& end) noexcept
+   {
+      if constexpr (has_streaming_state<Ctx> && requires { end = ctx.stream.data(); }) {
+         if (ctx.stream.enabled()) {
+            end = ctx.stream.data() + ctx.stream.size();
+         }
+      }
+   }
 }
