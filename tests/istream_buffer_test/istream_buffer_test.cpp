@@ -501,6 +501,40 @@ suite json_streaming_skip_unknown_tests = [] {
       expect(r.name == "after");
    };
 
+   "whitespace after the opening brace only, across a refill"_test = [] {
+      // Whitespace after `{` but none after the `,` before a member read after a
+      // refill: the refill moved the buffered text, so what was whitespace before it
+      // is other bytes now and must not be matched against. The text is longer than
+      // the buffer, so the refill moves it.
+      const std::string json = "{  \"name\":\"" + std::string(300, 'x') + "\",\"id\":5,\"fill\":\"" +
+                               std::string(600, 'y') + "\"}";
+      std::istringstream iss(json);
+      glz::istream_buffer<512> buffer(iss);
+
+      Record r{};
+      auto ec = glz::read_streaming<glz::opts{.error_on_unknown_keys = false}>(r, buffer);
+      expect(!ec) << glz::format_error(ec, json);
+      expect(r.id == 5);
+      expect(r.name.size() == 300u);
+   };
+
+   "whitespace after the opening bracket only, across a refill"_test = [] {
+      // Elements large enough that the buffer refills after each of them.
+      std::string json = "[  ";
+      for (int i = 0; i < 4; ++i) {
+         json += (i ? ",\"" : "\"") + std::string(400, char('a' + i)) + "\"";
+      }
+      json += "]";
+      std::istringstream iss(json);
+      glz::istream_buffer<512> buffer(iss);
+
+      std::vector<std::string> v;
+      auto ec = glz::read_streaming<glz::opts{}>(v, buffer);
+      expect(!ec) << glz::format_error(ec, json);
+      expect(v.size() == 4u);
+      expect(v.back() == std::string(400, 'd'));
+   };
+
    "skip unknown nested object larger than buffer"_test = [] {
       std::string json = R"({"fill":{)";
       for (int i = 0; i < 512; ++i) {

@@ -160,6 +160,21 @@ namespace glz
       }
    };
 
+   // The length of the whitespace after a container's opening byte, which the container's
+   // reader then matches against the whitespace after each `,` (skip_matching_ws). Zero
+   // for a streaming read: a refill moves the buffered text, so the bytes at `ws_start`
+   // are no longer that whitespace once the buffer has been refilled.
+   template <class Ctx>
+   GLZ_ALWAYS_INLINE size_t matchable_ws_size(Ctx& ctx, const auto* ws_start, const auto* it) noexcept
+   {
+      if constexpr (has_streaming_state<Ctx>) {
+         if (ctx.stream.enabled()) {
+            return 0;
+         }
+      }
+      return size_t(it - ws_start);
+   }
+
    template <auto Opts>
    GLZ_ALWAYS_INLINE bool parse_ws_colon(is_context auto& ctx, auto&& it, auto end) noexcept
    {
@@ -2331,7 +2346,7 @@ namespace glz
             return;
          }
 
-         const size_t ws_size = size_t(it - ws_start);
+         const size_t ws_size = matchable_ws_size(ctx, ws_start, it);
 
          static constexpr bool should_append = (resizable<T> || is_inplace_vector<T>) && check_append_arrays(Opts);
          if constexpr (not should_append) {
@@ -3062,7 +3077,7 @@ namespace glz
          if (skip_ws<Opts>(ctx, it, end)) {
             return;
          }
-         const size_t ws_size = size_t(it - ws_start);
+         const size_t ws_size = matchable_ws_size(ctx, ws_start, it);
 
          if constexpr ((glaze_object_t<T> || reflectable<T>) && num_members == 0 && Opts.error_on_unknown_keys) {
             if constexpr (not tag.sv().empty()) {
