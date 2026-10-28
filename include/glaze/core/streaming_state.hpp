@@ -95,6 +95,30 @@ namespace glz
       { ctx.stream } -> std::same_as<streaming_state&>;
    };
 
+   // A streaming refill point. When at most 1/Fraction of the buffered data is left
+   // ahead of `it` (or `it` is at `end`), the buffer is consumed up to `it` and refilled,
+   // and `it` and `end` follow it. A reader calls it before a step that needs data
+   // ahead: Fraction 2 before a value that must be buffered whole leaves at least half
+   // the buffer ahead of it; Fraction 1 refills unconditionally.
+   // Returns false when nothing is left ahead and the stream is at its end. Without
+   // streaming it does nothing and returns true.
+   template <size_t Fraction, class Ctx>
+      requires(Fraction > 0)
+   inline bool stream_refill_point(Ctx& ctx, const char*& it, const char*& end) noexcept
+   {
+      if constexpr (has_streaming_state<Ctx>) {
+         if (ctx.stream.enabled()) {
+            const size_t consumed = static_cast<size_t>(it - ctx.stream.data());
+            const size_t size = ctx.stream.size();
+            if (size - consumed <= size / Fraction || it >= end) {
+               ctx.stream.consume_and_refill(consumed, it, end);
+               return it < end || !ctx.stream.at_eof();
+            }
+         }
+      }
+      return true;
+   }
+
    // Re-derives `end` from the stream after a read that may have refilled the buffer:
    // the type-specific readers take `end` by value, so after a refill the caller's copy
    // no longer marks where the buffered data ends. A no-op without streaming.

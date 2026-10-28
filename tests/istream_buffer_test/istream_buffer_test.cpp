@@ -4382,4 +4382,57 @@ suite streaming_refill_across_value_tests = [] {
    };
 };
 
+suite stream_refill_point_tests = [] {
+   "stream_refill_point refills once at most the fraction is left ahead"_test = [] {
+      std::string text(2048, 'x');
+      for (size_t i = 0; i < text.size(); ++i) {
+         text[i] = char('a' + i % 26);
+      }
+      std::istringstream iss(text);
+      glz::istream_buffer<512> buffer(iss);
+      glz::streaming_context ctx{};
+      ctx.stream = glz::make_streaming_state(buffer);
+
+      const char* it = buffer.data();
+      const char* end = buffer.data() + buffer.size();
+      expect(buffer.size() == 512u);
+
+      // More than half is ahead: no refill.
+      it += 200;
+      const char* before = it;
+      expect(glz::stream_refill_point<2>(ctx, it, end));
+      expect(it == before);
+
+      // Half is ahead: the buffer moves on to `it`, which then is its front.
+      it += 56;
+      const char expected = *it;
+      expect(glz::stream_refill_point<2>(ctx, it, end));
+      expect(it == buffer.data());
+      expect(*it == expected);
+      expect(size_t(end - it) == 512u);
+
+      // Fraction 1 refills unconditionally.
+      ++it;
+      expect(glz::stream_refill_point<1>(ctx, it, end));
+      expect(it == buffer.data());
+      expect(*it == char('a' + 257 % 26));
+
+      // At the end of the stream with nothing ahead: false.
+      it = end;
+      while (glz::stream_refill_point<1>(ctx, it, end)) {
+         it = end;
+      }
+      expect(it == end);
+   };
+
+   "stream_refill_point without streaming does nothing"_test = [] {
+      glz::context ctx{};
+      const std::string_view text = "abc";
+      const char* it = text.data() + 3;
+      const char* end = text.data() + 3;
+      expect(glz::stream_refill_point<1>(ctx, it, end));
+      expect(it == text.data() + 3);
+   };
+};
+
 int main() { return 0; }
