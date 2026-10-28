@@ -2,9 +2,12 @@
 // For the license information refer to glaze.hpp
 
 #include <limits>
+#include <sstream>
 
 #include "glaze/containers/ordered_small_map.hpp"
+#include "glaze/core/istream_buffer.hpp"
 #include "glaze/glaze_exceptions.hpp"
+#include "glaze/json/member_reader.hpp"
 #include "glaze/thread/async.hpp"
 #include "glaze/thread/async_string.hpp"
 #include "glaze/thread/shared_async_map.hpp"
@@ -800,6 +803,24 @@ suite ordered_small_map_overflow_tests = [] {
          // 32-bit size_t cannot represent > uint32_t, so this overflow path is unreachable.
          expect(true);
       }
+   };
+};
+
+suite member_reader_exceptions = [] {
+   "what a member reader throws reaches the caller of a streaming read"_test = [] {
+      glz::member_reader reader{[](std::string_view const key, auto&, const char*&, const char*) {
+         throw std::runtime_error{std::string{key}};
+      }};
+      std::istringstream stream{R"({"k": 1})"};
+      glz::basic_istream_buffer<std::istringstream> buffer{stream};
+      std::string message;
+      try {
+         static_cast<void>(glz::read_streaming<glz::opts{.null_terminated = false}>(reader, buffer));
+      }
+      catch (const std::runtime_error& e) {
+         message = e.what();
+      }
+      expect(message == "k");
    };
 };
 
