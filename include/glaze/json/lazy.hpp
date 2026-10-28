@@ -280,6 +280,36 @@ namespace glz
          }
       }
 
+      // Whether a JSON value can start with `c`.
+      constexpr bool lazy_value_start(const char c) noexcept
+      {
+         switch (c) {
+         case '{':
+         case '[':
+         case '"':
+         case 't':
+         case 'f':
+         case 'n':
+         case '-':
+            return true;
+         default:
+            return c >= '0' && c <= '9';
+         }
+      }
+
+      // skip_value_lazy for a reader that must not step over a byte no value starts with:
+      // such a byte at `p` sets `ec` to syntax_error and is returned. Only the first byte is
+      // checked; what a value holds is validated where it is read.
+      template <auto Opts>
+      GLZ_ALWAYS_INLINE const char* skip_value_lazy(const char* p, const char* end, error_code& ec) noexcept
+      {
+         if (p < end && !lazy_value_start(*p)) [[unlikely]] {
+            ec = error_code::syntax_error;
+            return p;
+         }
+         return skip_value_lazy<Opts>(p, end);
+      }
+
       // Opt-in streaming cursor storage (see lazy_streaming_cursor_policy).
       struct lazy_streaming_extent_disabled
       {
@@ -417,6 +447,76 @@ namespace glz
 
    template <auto Opts>
    using lazy_streaming_slot = typename detail::lazy_streaming_slot_for<Opts>::type;
+
+   // ============================================================================
+   // Window scans - structural scans of a buffer that holds a part of a JSON text, such
+   // as the buffer of a streaming read. They never read at or past `end`, and reaching
+   // it is not an error: the scan reports how far it got, so that the caller can refill
+   // the buffer and scan again. An element or member counts as complete once the byte
+   // after it is in the buffer (a number could otherwise continue past `end`).
+   // ============================================================================
+
+   // The complete elements of an array in [from, end): see count_complete_elements.
+   struct window_elements
+   {
+      size_t count{}; // complete elements
+      const char* first{}; // the first byte of the first of them, when there are any
+      // Past the array's `]` when it is closed in the buffer; else the `,` before the first
+      // element that is not complete in it, or `from` when none is. On an error, the byte
+      // the error is at.
+      const char* stop{};
+      bool closed{}; // the array's `]` is in the buffer
+      error_code ec{};
+   };
+
+   // Counts the elements of an array that are complete in [from, end), from `from` on:
+   // the array's `[`, or the `,` after the elements already read. Elements are skipped,
+   // not validated, except that one must start with a byte a value can start with.
+   // A lazy_iterator constructed at `from` (with `end` and is_object false) iterates
+   // these elements: it steps over the `[` or `,` it starts at.
+   template <auto Opts>
+   inline window_elements count_complete_elements(const char* from, const char* end) noexcept
+   {
+      window_elements run{.stop = from};
+      auto skip_ws = [end](const char* p) noexcept {
+         while (p < end && whitespace_table[uint8_t(*p)]) {
+            ++p;
+         }
+         return p;
+      };
+      const char* p = skip_ws(from + 1);
+      if (p < end && *p == ']' && *from == '[') {
+         return {.stop = p + 1, .closed = true};
+      }
+      while (p < end) {
+         const char* const first = p;
+         p = detail::skip_value_lazy<Opts>(p, end, run.ec);
+         if (bool(run.ec)) [[unlikely]] {
+            run.stop = p;
+            return run;
+         }
+         p = skip_ws(p);
+         if (p >= end) {
+            break;
+         }
+         if (run.count++ == 0) {
+            run.first = first;
+         }
+         if (*p == ']') {
+            run.stop = p + 1;
+            run.closed = true;
+            return run;
+         }
+         if (*p != ',') [[unlikely]] {
+            run.stop = p;
+            run.ec = error_code::expected_comma;
+            return run;
+         }
+         run.stop = p;
+         p = skip_ws(p + 1);
+      }
+      return run;
+   }
 
    // ============================================================================
    // lazy_json_view - Truly lazy view with on-demand scanning
