@@ -4148,6 +4148,20 @@ struct glz::meta<unknown_raw_record>
    static constexpr auto unknown_read = &T::extra;
 };
 
+// An object without members: every key is unknown and read into `extra`.
+struct unknown_only_record
+{
+   std::map<std::string, glz::raw_json> extra{};
+};
+
+template <>
+struct glz::meta<unknown_only_record>
+{
+   using T = unknown_only_record;
+   static constexpr auto value = object();
+   static constexpr auto unknown_read = &T::extra;
+};
+
 struct skipped_member_record
 {
    int x{};
@@ -4250,13 +4264,18 @@ struct chunk_window
    size_t data_end{};
    size_t total{};
    bool source_done{};
+   bool over_consumed{}; // a reader consumed more than was buffered: past the data, into stale bytes
 
    const char* data() const noexcept { return storage.data() + read_pos; }
    size_t size() const noexcept { return data_end - read_pos; }
    bool empty() const noexcept { return size() == 0; }
    bool eof() const noexcept { return source_done && empty(); }
-   void consume(size_t const n) noexcept
+   void consume(size_t n) noexcept
    {
+      if (n > size()) {
+         over_consumed = true;
+         n = size();
+      }
       read_pos += n;
       total += n;
    }
@@ -4401,6 +4420,26 @@ suite streaming_refill_across_value_tests = [] {
          [](auto const& s, auto const& w) { return s.after == w.after && s.first == w.first; });
    };
 
+   "after an unknown key's refilling read the object's end is where the data ends"_test = [] {
+      // Whitespace in the value is left behind in the buffer past the data a later
+      // refill brings, where an `end` gone stale would let a skip of whitespace run.
+      std::string spaced{"["};
+      for (size_t i = 0; i < 200; ++i) {
+         spaced += "1,                    ";
+      }
+      spaced += "1]";
+      std::string const json = R"({"first":)" + spaced + R"(                    ,"after":7})";
+      for (size_t cut = json.size() - 40; cut <= json.size(); ++cut) {
+         auto const text = json.substr(0, cut);
+         unknown_only_record streamed{}, whole{};
+         chunk_window buffer{.source = text, .chunk = 7};
+         auto const s_ec = glz::read_streaming<refill_test_opts>(streamed, buffer);
+         auto const w_ec = read_whole(whole, text);
+         expect(bool(s_ec) == bool(w_ec) && not buffer.over_consumed)
+            << "cut " << cut << ": " << glz::format_error(s_ec.ec) << " vs " << glz::format_error(w_ec.ec);
+      }
+   };
+
    "after a refilling read the caller's end is where the data ends"_test = [] {
       // The refills run up to the end of the input, where less data is buffered
       // than before the last one.
@@ -4442,6 +4481,33 @@ suite member_reader_tests = [] {
          expect(!ec) << glz::format_error(ec, json);
          expect(keys == std::vector<std::string>{"a", "large", "s", "b", "c"}) << chunk;
          expect(a == 1 && c == 4) << chunk;
+      }
+   };
+
+   "a skipped member that ends where the buffered data does is followed by the rest"_test = [] {
+      // Wherever the skipped value's last byte falls relative to the buffer's end.
+      std::vector<int> items;
+      int n{};
+      glz::member_reader reader{[&](std::string_view const key, auto& ctx, const char*& it, const char* end) {
+         if (key == "items") {
+            glz::parse<glz::JSON>::op<refill_test_opts>(items, ctx, it, end);
+         }
+         else if (key == "n") {
+            glz::parse<glz::JSON>::op<refill_test_opts>(n, ctx, it, end);
+         }
+         else {
+            glz::skip_value<glz::JSON>::op<refill_test_opts>(ctx, it, end);
+         }
+      }};
+      for (size_t pad = 0; pad < 1100; ++pad) {
+         std::string const json = R"({"skip":{"a":")" + std::string(pad, 'x') + R"("},"items":[1,2,3],"n":1})";
+         for (size_t const chunk : {size_t(1), size_t(7), size_t(4096)}) {
+            items.clear();
+            n = 0;
+            auto const ec = read_chunked(reader, json, chunk);
+            expect(!ec && items == std::vector<int>{1, 2, 3} && n == 1)
+               << "pad " << pad << " chunk " << chunk << ": " << glz::format_error(ec, json);
+         }
       }
    };
 };
