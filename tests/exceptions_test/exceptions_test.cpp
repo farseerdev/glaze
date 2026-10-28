@@ -7,6 +7,7 @@
 #include "glaze/containers/ordered_small_map.hpp"
 #include "glaze/core/istream_buffer.hpp"
 #include "glaze/glaze_exceptions.hpp"
+#include "glaze/json/element_reader.hpp"
 #include "glaze/json/member_reader.hpp"
 #include "glaze/thread/async.hpp"
 #include "glaze/thread/async_string.hpp"
@@ -821,6 +822,24 @@ suite member_reader_exceptions = [] {
          message = e.what();
       }
       expect(message == "k");
+   };
+};
+
+suite element_reader_exceptions = [] {
+   "what an element reader throws reaches the caller of a streaming read"_test = [] {
+      glz::element_reader reader{[](size_t const index, auto&, const char*&, const char*) {
+         throw std::runtime_error{std::to_string(index)};
+      }};
+      std::istringstream stream{R"([1])"};
+      glz::basic_istream_buffer<std::istringstream> buffer{stream};
+      std::string message;
+      try {
+         static_cast<void>(glz::read_streaming<glz::opts{.null_terminated = false}>(reader, buffer));
+      }
+      catch (const std::runtime_error& e) {
+         message = e.what();
+      }
+      expect(message == "0");
    };
 };
 
