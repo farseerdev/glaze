@@ -4512,6 +4512,109 @@ suite member_reader_tests = [] {
    };
 };
 
+suite element_reader_tests = [] {
+   "an element reader is not called for an empty array"_test = [] {
+      size_t calls{};
+      glz::element_reader reader{[&](size_t, auto& ctx, const char*& it, const char* end) {
+         ++calls;
+         glz::skip_value<glz::JSON>::op<refill_test_opts>(ctx, it, end);
+      }};
+      for (std::string const json : {"[]", "[ ]", " [\n\t] "}) {
+         auto const ec = read_chunked(reader, json, 1);
+         expect(!ec) << glz::format_error(ec, json);
+      }
+      expect(calls == 0);
+   };
+
+   "an element reader is called at each element, through refills"_test = [] {
+      // Whitespace around the commas and a large element whose read refills the
+      // buffer: the separators after it are read from a refilled buffer.
+      std::string json = "[ 0";
+      std::vector<int> expected{0};
+      for (int i = 1; i < 300; ++i) {
+         json += (i % 3 == 0) ? "\n  ,\t" : " , ";
+         if (i == 150) {
+            json += large_array(200);
+            expected.push_back(-1);
+         }
+         else {
+            json += std::to_string(i);
+            expected.push_back(i);
+         }
+      }
+      json += " \n]";
+      std::vector<int> values;
+      std::vector<size_t> indices;
+      glz::element_reader reader{[&](size_t const index, auto& ctx, const char*& it, const char* end) {
+         indices.push_back(index);
+         if (*it == '[') {
+            glz::skip_value<glz::JSON>::op<refill_test_opts>(ctx, it, end);
+            values.push_back(-1);
+            return;
+         }
+         int v{};
+         glz::parse<glz::JSON>::op<refill_test_opts>(v, ctx, it, end);
+         values.push_back(v);
+      }};
+      for (size_t const chunk : {size_t(1), size_t(7), size_t(4096)}) {
+         values.clear();
+         indices.clear();
+         auto const ec = read_chunked(reader, json, chunk);
+         expect(!ec) << glz::format_error(ec, json);
+         expect(values == expected) << chunk;
+         expect(indices.size() == expected.size() && indices.back() == expected.size() - 1) << chunk;
+      }
+   };
+
+   "an element reader composes with a member reader for each element"_test = [] {
+      std::string json = "[";
+      for (int i = 0; i < 100; ++i) {
+         json += (i == 0 ? "" : ",") + std::string{R"({"name":"element )"} + std::to_string(i) + R"(", "id": )" +
+                 std::to_string(i) + "}";
+      }
+      json += "]";
+      std::vector<int> ids;
+      glz::element_reader reader{[&](size_t, auto& ctx, const char*& it, const char* end) {
+         glz::member_reader element{[&](std::string_view const key, auto& member_ctx, const char*& member_it,
+                                        const char* member_end) {
+            if (key == "id") {
+               glz::parse<glz::JSON>::op<refill_test_opts>(ids.emplace_back(), member_ctx, member_it, member_end);
+            }
+            else {
+               glz::skip_value<glz::JSON>::op<refill_test_opts>(member_ctx, member_it, member_end);
+            }
+         }};
+         glz::parse<glz::JSON>::op<refill_test_opts>(element, ctx, it, end);
+      }};
+      for (size_t const chunk : {size_t(1), size_t(7), size_t(4096)}) {
+         ids.clear();
+         auto const ec = read_chunked(reader, json, chunk);
+         expect(!ec) << glz::format_error(ec, json);
+         expect(ids.size() == 100 && ids.back() == 99) << chunk;
+      }
+   };
+
+   "an element reader rejects a missing comma, a trailing comma and a truncated array"_test = [] {
+      glz::element_reader reader{[&](size_t, auto& ctx, const char*& it, const char* end) {
+         int v{};
+         glz::parse<glz::JSON>::op<refill_test_opts>(v, ctx, it, end);
+      }};
+      auto const ec_missing_comma = read_chunked(reader, "[1, 2 3]", 1);
+      expect(ec_missing_comma.ec == glz::error_code::expected_bracket) << glz::format_error(ec_missing_comma.ec);
+      auto const ec_trailing_comma = read_chunked(reader, "[1, 2, ]", 1);
+      expect(bool(ec_trailing_comma)) << "a trailing comma is an error";
+
+      std::string const json = "[ 1 , 22 , 333 ]";
+      for (size_t cut = 0; cut < json.size(); ++cut) {
+         for (size_t const chunk : {size_t(1), size_t(3), size_t(4096)}) {
+            chunk_window buffer{.source = std::string_view{json}.substr(0, cut), .chunk = chunk};
+            auto const ec = glz::read_streaming<refill_test_opts>(reader, buffer);
+            expect(bool(ec) && not buffer.over_consumed) << "cut " << cut << " chunk " << chunk;
+         }
+      }
+   };
+};
+
 suite stream_refill_point_tests = [] {
    "stream_refill_point refills once at most the fraction is left ahead"_test = [] {
       std::string text(2048, 'x');

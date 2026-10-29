@@ -7,6 +7,7 @@
 #include "glaze/core/istream_buffer.hpp"
 #include "glaze/core/manage.hpp"
 #include "glaze/core/wrapper_traits.hpp"
+#include "glaze/json/element_reader.hpp"
 #include "glaze/json/escape_unicode.hpp"
 #include "glaze/json/float_format.hpp"
 #include "glaze/json/generic.hpp"
