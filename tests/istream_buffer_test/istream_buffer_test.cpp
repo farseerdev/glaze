@@ -4416,6 +4416,36 @@ suite streaming_refill_across_value_tests = [] {
    };
 };
 
+suite member_reader_tests = [] {
+   "a member reader is called at each member's value, through refills"_test = [] {
+      // The large member's skip refills the buffer; the members after it read as
+      // from one buffer.
+      const std::string json = R"({"a": 1,"large":)" + large_array(300) + R"(,"s":"x" , "b":[2,3], "c":4})";
+      std::vector<std::string> keys;
+      int a{};
+      int c{};
+      glz::member_reader reader{[&](std::string_view const key, auto& ctx, const char*& it, const char* end) {
+         keys.emplace_back(key);
+         if (key == "a") {
+            glz::parse<glz::JSON>::op<refill_test_opts>(a, ctx, it, end);
+         }
+         else if (key == "c") {
+            glz::parse<glz::JSON>::op<refill_test_opts>(c, ctx, it, end);
+         }
+         else {
+            glz::skip_value<glz::JSON>::op<refill_test_opts>(ctx, it, end);
+         }
+      }};
+      for (size_t const chunk : {size_t(1), size_t(7), size_t(4096)}) {
+         keys.clear();
+         auto const ec = read_chunked(reader, json, chunk);
+         expect(!ec) << glz::format_error(ec, json);
+         expect(keys == std::vector<std::string>{"a", "large", "s", "b", "c"}) << chunk;
+         expect(a == 1 && c == 4) << chunk;
+      }
+   };
+};
+
 suite stream_refill_point_tests = [] {
    "stream_refill_point refills once at most the fraction is left ahead"_test = [] {
       std::string text(2048, 'x');
