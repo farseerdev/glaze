@@ -1691,4 +1691,83 @@ suite dynamic_key_custom_tests = [] {
    };
 };
 
+suite window_scan_tests = [] {
+   static constexpr glz::opts kWindow{.null_terminated = false};
+
+   "skip_value_lazy with an error reports a byte no value starts with"_test = [] {
+      for (std::string_view json : {"}", "]", ",", ":", "x"}) {
+         glz::error_code ec{};
+         const char* p = glz::detail::skip_value_lazy<kWindow>(json.data(), json.data() + json.size(), ec);
+         expect(ec == glz::error_code::syntax_error) << json;
+         expect(p == json.data()) << json;
+      }
+      for (std::string_view json : {"1,", "-2,", R"("a",)", "true,", "null,", "[1,2],", R"({"a":1},)"}) {
+         glz::error_code ec{};
+         const char* p = glz::detail::skip_value_lazy<kWindow>(json.data(), json.data() + json.size(), ec);
+         expect(!bool(ec)) << json;
+         expect(*p == ',') << json;
+      }
+   };
+
+   "count_complete_elements counts the elements whose next byte is in the buffer"_test = [] {
+      const std::string_view json = R"([1, "two", [3], {"four": 4}, 56)";
+      const auto* const end = json.data() + json.size();
+      const auto run = glz::count_complete_elements<kWindow>(json.data(), end);
+      expect(!bool(run.ec));
+      expect(!run.closed);
+      // 56 could continue past the buffer's end.
+      expect(run.count == 4u);
+      expect(run.first == json.data() + 1);
+      expect(*run.stop == ',');
+      expect(std::string_view{run.stop, size_t(end - run.stop)} == ", 56");
+   };
+
+   "count_complete_elements of a closed array stops past its bracket"_test = [] {
+      const std::string_view json = R"([1, 2] , "next")";
+      const auto run = glz::count_complete_elements<kWindow>(json.data(), json.data() + json.size());
+      expect(!bool(run.ec));
+      expect(run.closed);
+      expect(run.count == 2u);
+      expect(*run.stop == ' ');
+
+      const std::string_view empty = "[ ]";
+      const auto none = glz::count_complete_elements<kWindow>(empty.data(), empty.data() + empty.size());
+      expect(none.closed);
+      expect(none.count == 0u);
+      expect(none.stop == empty.data() + empty.size());
+   };
+
+   "count_complete_elements continues from a comma, as a lazy_iterator does"_test = [] {
+      // Two batches of one array: the second starts at the `,` the first stopped at.
+      std::string json = R"({"rows": [10, 20, 30]})";
+      auto doc = glz::lazy_json<kWindow>(json);
+      expect(doc.has_value());
+      const char* const end = json.data() + json.size();
+      const char* const open = json.data() + json.find('[');
+      const auto first = glz::count_complete_elements<kWindow>(open, json.data() + json.find("30"));
+      expect(first.count == 2u);
+      expect(*first.stop == ',');
+      const auto second = glz::count_complete_elements<kWindow>(first.stop, end);
+      expect(second.count == 1u);
+      expect(second.closed);
+      expect(*second.first == '3');
+
+      int64_t sum{};
+      size_t n{};
+      for (glz::lazy_iterator<kWindow> it{&*doc, first.stop, end, false}; n < second.count; ++it, ++n) {
+         sum += (*it).get<int64_t>().value();
+      }
+      expect(sum == 30);
+   };
+
+   "count_complete_elements reports a malformed element at its byte"_test = [] {
+      const std::pair<std::string_view, size_t> cases[] = {{"[1, }", 4}, {"[[1], ]", 6}, {"[1 2]", 3}};
+      for (const auto& [json, at] : cases) {
+         const auto run = glz::count_complete_elements<kWindow>(json.data(), json.data() + json.size());
+         expect(bool(run.ec)) << json;
+         expect(run.stop == json.data() + at) << json;
+      }
+   };
+};
+
 int main() { return 0; }

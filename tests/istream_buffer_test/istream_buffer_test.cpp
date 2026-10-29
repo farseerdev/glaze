@@ -501,6 +501,40 @@ suite json_streaming_skip_unknown_tests = [] {
       expect(r.name == "after");
    };
 
+   "whitespace after the opening brace only, across a refill"_test = [] {
+      // Whitespace after `{` but none after the `,` before a member read after a
+      // refill: the refill moved the buffered text, so what was whitespace before it
+      // is other bytes now and must not be matched against. The text is longer than
+      // the buffer, so the refill moves it.
+      const std::string json = "{  \"name\":\"" + std::string(300, 'x') + "\",\"id\":5,\"fill\":\"" +
+                               std::string(600, 'y') + "\"}";
+      std::istringstream iss(json);
+      glz::istream_buffer<512> buffer(iss);
+
+      Record r{};
+      auto ec = glz::read_streaming<glz::opts{.error_on_unknown_keys = false}>(r, buffer);
+      expect(!ec) << glz::format_error(ec, json);
+      expect(r.id == 5);
+      expect(r.name.size() == 300u);
+   };
+
+   "whitespace after the opening bracket only, across a refill"_test = [] {
+      // Elements large enough that the buffer refills after each of them.
+      std::string json = "[  ";
+      for (int i = 0; i < 4; ++i) {
+         json += (i ? ",\"" : "\"") + std::string(400, char('a' + i)) + "\"";
+      }
+      json += "]";
+      std::istringstream iss(json);
+      glz::istream_buffer<512> buffer(iss);
+
+      std::vector<std::string> v;
+      auto ec = glz::read_streaming<glz::opts{}>(v, buffer);
+      expect(!ec) << glz::format_error(ec, json);
+      expect(v.size() == 4u);
+      expect(v.back() == std::string(400, 'd'));
+   };
+
    "skip unknown nested object larger than buffer"_test = [] {
       std::string json = R"({"fill":{)";
       for (int i = 0; i < 512; ++i) {
@@ -4379,6 +4413,59 @@ suite streaming_refill_across_value_tests = [] {
          ec = read_chunked(read, json, 7);
          expect(!ec && read.after == 7 && read.end_followed) << glz::format_error(ec, json);
       }
+   };
+};
+
+suite stream_refill_point_tests = [] {
+   "stream_refill_point refills once at most the fraction is left ahead"_test = [] {
+      std::string text(2048, 'x');
+      for (size_t i = 0; i < text.size(); ++i) {
+         text[i] = char('a' + i % 26);
+      }
+      std::istringstream iss(text);
+      glz::istream_buffer<512> buffer(iss);
+      glz::streaming_context ctx{};
+      ctx.stream = glz::make_streaming_state(buffer);
+
+      const char* it = buffer.data();
+      const char* end = buffer.data() + buffer.size();
+      expect(buffer.size() == 512u);
+
+      // More than half is ahead: no refill.
+      it += 200;
+      const char* before = it;
+      expect(glz::stream_refill_point<2>(ctx, it, end));
+      expect(it == before);
+
+      // Half is ahead: the buffer moves on to `it`, which then is its front.
+      it += 56;
+      const char expected = *it;
+      expect(glz::stream_refill_point<2>(ctx, it, end));
+      expect(it == buffer.data());
+      expect(*it == expected);
+      expect(size_t(end - it) == 512u);
+
+      // Fraction 1 refills unconditionally.
+      ++it;
+      expect(glz::stream_refill_point<1>(ctx, it, end));
+      expect(it == buffer.data());
+      expect(*it == char('a' + 257 % 26));
+
+      // At the end of the stream with nothing ahead: false.
+      it = end;
+      while (glz::stream_refill_point<1>(ctx, it, end)) {
+         it = end;
+      }
+      expect(it == end);
+   };
+
+   "stream_refill_point without streaming does nothing"_test = [] {
+      glz::context ctx{};
+      const std::string_view text = "abc";
+      const char* it = text.data() + 3;
+      const char* end = text.data() + 3;
+      expect(glz::stream_refill_point<1>(ctx, it, end));
+      expect(it == text.data() + 3);
    };
 };
 
