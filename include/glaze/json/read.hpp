@@ -70,8 +70,9 @@ namespace glz
       }
 
       // This unknown key handler should not be given unescaped keys, that is for the user to handle.
+      // After it `end` follows the buffered data, which the read of the value may have refilled.
       template <auto Opts, class T, is_context Ctx, class It0, class It1>
-      static void handle_unknown(const sv& key, T&& value, Ctx&& ctx, It0&& it, It1 end)
+      static void handle_unknown(const sv& key, T&& value, Ctx&& ctx, It0&& it, It1&& end)
       {
          using ValueType = std::decay_t<decltype(value)>;
          if constexpr (has_unknown_reader<ValueType>) {
@@ -144,6 +145,7 @@ namespace glz
          else {
             skip_value<JSON>::op<Opts>(ctx, it, end);
          }
+         sync_stream_end(ctx, end);
       }
    };
 
@@ -3314,6 +3316,13 @@ namespace glz
                      parse<JSON>::handle_unknown<Opts>(key, value, ctx, it, end);
                      if (bool(ctx.error)) [[unlikely]]
                         return;
+                     // The value may end where the buffered data does, with more to come.
+                     if constexpr (has_streaming_state<decltype(ctx)>) {
+                        if (!stream_refill_point<4>(ctx, it, end)) [[unlikely]] {
+                           ctx.error = error_code::unexpected_end;
+                           return;
+                        }
+                     }
                      if constexpr (not Opts.null_terminated) {
                         if (it == end) [[unlikely]] {
                            ctx.error = error_code::unexpected_end;
