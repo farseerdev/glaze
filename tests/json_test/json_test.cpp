@@ -6738,6 +6738,51 @@ break"])";
    };
 };
 
+suite validate_json_nesting = [] {
+   auto const nested = [](std::size_t depth, std::string_view open, std::string_view close) {
+      std::string json;
+      for (std::size_t i = 0; i < depth; ++i) json += open;
+      json += "1";
+      for (std::size_t i = 0; i < depth; ++i) json += close;
+      return json;
+   };
+
+   auto const validate_both = [](std::string const& json) {
+      auto const terminated = glz::validate_json(json).ec;
+      expect(terminated == glz::validate_json(std::string_view{json}).ec);
+      return terminated;
+   };
+
+   "nesting up to the limit is valid"_test = [&] {
+      expect(validate_both(nested(glz::max_recursive_depth_limit, "[", "]")) == glz::error_code::none);
+      expect(validate_both(nested(glz::max_recursive_depth_limit, R"({"a":)", "}")) == glz::error_code::none);
+   };
+
+   "nesting beyond the limit is refused"_test = [&] {
+      expect(validate_both(nested(glz::max_recursive_depth_limit + 1, "[", "]")) ==
+             glz::error_code::exceeded_max_recursive_depth);
+      expect(validate_both(nested(glz::max_recursive_depth_limit + 1, R"({"a":)", "}")) ==
+             glz::error_code::exceeded_max_recursive_depth);
+   };
+
+   "a deep input is refused before it can exhaust the stack"_test = [&] {
+      expect(validate_both(std::string(1'000'000, '[')) == glz::error_code::exceeded_max_recursive_depth);
+      expect(validate_both(nested(1'000'000, "[", "]")) == glz::error_code::exceeded_max_recursive_depth);
+   };
+
+   "sibling containers do not add up"_test = [&] {
+      std::string json = "[";
+      for (std::size_t i = 0; i < 1000; ++i) json += "[[1]],";
+      json += "[]]";
+      expect(validate_both(json) == glz::error_code::none);
+   };
+
+   "an input that ends inside a container stays invalid"_test = [&] {
+      expect(validate_both("[[1]") != glz::error_code::none);
+      expect(validate_both(R"({"a":{"b":1})") != glz::error_code::none);
+   };
+};
+
 suite utf8_validate = [] {
    "utf8_validate"_test = [] {
       // In ANSI (GBK) encoding
